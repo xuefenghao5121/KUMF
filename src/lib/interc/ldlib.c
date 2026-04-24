@@ -264,9 +264,14 @@ extern "C" void *malloc(size_t sz)
         }
     }
     if (sz > 4096 && !_in_trace && log_arr) {
-        if (log_arr->callchain_size >= 4) {
+        if (log_arr->callchain_size >= 2) {
             char **strings = backtrace_symbols (log_arr->callchain_strings, log_arr->callchain_size);
-            int ret = check_trace(strings[3], sz);
+            /* KUMF: scan all frames instead of hardcoded index */
+            int ret = -1;
+            for (size_t fi = 0; fi < log_arr->callchain_size; fi++) {
+                ret = check_trace(strings[fi], sz);
+                if (ret > -1) break;
+            }
             libc_free(strings);
             if (ret > -1) {
                 addr = numa_alloc_onnode(sz, ret);
