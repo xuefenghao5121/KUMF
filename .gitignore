@@ -1,0 +1,32 @@
+# .gitignore
+
+# Build
+build/
+*.o
+*.so
+*.a
+bench
+hnswlib_bench
+mini_md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Results (大文件，不提交)
+results/*.data
+results/*.log
+results/perf.data*
+
+# hnswlib clone
+hnswlib/
+
+# Temp
+/tmp/
+*.tmp
