@@ -16,22 +16,7 @@
 #include <new>
 #include <sys/types.h>
 #include <sys/syscall.h>
-#ifdef HAS_NUMA_H
 #include <numa.h>
-#else
-/* Without libnuma headers, use numa_alloc via dlsym */
-static void *(*kumf_numa_alloc_onnode)(size_t, int) = NULL;
-static void (*kumf_numa_free)(void *, size_t) = NULL;
-static void kumf_init_numa(void) {
-    if (kumf_numa_alloc_onnode) return;
-    void *h = dlopen("libnuma.so", RTLD_LAZY);
-    if (!h) h = dlopen("libnuma.so.1", RTLD_LAZY);
-    if (h) {
-        kumf_numa_alloc_onnode = (void *(*)(size_t, int))dlsym(h, "numa_alloc_onnode");
-        kumf_numa_free = (void (*)(void *, size_t))dlsym(h, "numa_free");
-    }
-}
-#endif
 
 #define ARR_SIZE 550000            /* Max number of malloc per core */
 #define MAX_TID 512                /* Max number of tids to profile */
@@ -284,13 +269,7 @@ extern "C" void *malloc(size_t sz)
             int ret = check_trace(strings[3], sz);
             libc_free(strings);
             if (ret > -1) {
-                #ifdef HAS_NUMA_H
                 addr = numa_alloc_onnode(sz, ret);
-                #else
-                kumf_init_numa();
-                if (kumf_numa_alloc_onnode) addr = kumf_numa_alloc_onnode(sz, ret);
-                else addr = libc_malloc(sz);
-                #endif
                 record_seg((unsigned long)addr, sz);
             } else {
                 addr = libc_malloc(sz);
@@ -379,13 +358,7 @@ extern "C" void free(void *p)
     if (!_in_trace && libc_free) {
         size_t size_to_free = check_seg((unsigned long) p);
         if (size_to_free > 0) {
-            #ifdef HAS_NUMA_H
             numa_free(p, size_to_free);
-            #else
-            kumf_init_numa();
-            if (kumf_numa_free) kumf_numa_free(p, size_to_free);
-            else libc_free(p);
-            #endif
             return;
         } else {
             libc_free(p);

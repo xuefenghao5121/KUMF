@@ -22,10 +22,8 @@
 #include <errno.h>
 #include <time.h>
 
-#ifdef HAS_NUMA_H
 #include <numa.h>
 #include <numaif.h>
-#endif
 
 #include <stdint.h>
 #include <stdbool.h>

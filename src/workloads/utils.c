@@ -1,26 +1,7 @@
 #include "utils.h"
 #include <stdio.h>
-#ifdef HAS_NUMA_H
 #include <numa.h>
 #include <numaif.h>
-#else
-#include <stdlib.h>
-#include <string.h>
-#include <dlfcn.h>
-/* Fallback without libnuma headers */
-static void *(*kumf_numa_alloc_onnode)(size_t, int) = NULL;
-static void kumf_init_numa(void) {
-    if (kumf_numa_alloc_onnode) return;
-    void *h = dlopen("libnuma.so.1", RTLD_LAZY);
-    if (!h) h = dlopen("libnuma.so", RTLD_LAZY);
-    if (h) kumf_numa_alloc_onnode = (void *(*)(size_t, int))dlsym(h, "numa_alloc_onnode");
-}
-static char *numa_alloc_onnode_fallback(size_t size, int node) {
-    kumf_init_numa();
-    if (kumf_numa_alloc_onnode) return (char *)kumf_numa_alloc_onnode(size, node);
-    return malloc(size);
-}
-#endif
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
@@ -89,13 +70,7 @@ int init_buf(uint64_t size, int node, char **alloc_ptr)
     unsigned long page_size;
     uint64_t page_cnt;
     uint64_t idx;
-    if ((ptr = (char *)
-    #ifdef HAS_NUMA_H
-    numa_alloc_onnode(size, node)
-    #else
-    numa_alloc_onnode_fallback(size, node)
-    #endif
-    ) == NULL) {
+    if ((ptr = (char *)numa_alloc_onnode(size, node)) == NULL) {
         fprintf(stderr,"ERROR: numa_alloc_onnode\n");
         return -1;
     }

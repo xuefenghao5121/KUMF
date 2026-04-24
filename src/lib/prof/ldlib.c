@@ -16,9 +16,7 @@
 #include <new>
 #include <sys/types.h>
 #include <sys/syscall.h>
-#ifdef HAS_NUMA_H
 #include <numa.h>
-#endif
 
 #define ARR_SIZE 1000000              /* Max number of malloc per core (ARM: reduced from 950M, 1M×96B≈96MB/thread) */
 #define MAX_TID 512                /* Max number of tids to profile */
