@@ -19,10 +19,8 @@ mini_md
 .DS_Store
 Thumbs.db
 
-# Results (大文件，不提交)
-results/*.data
-results/*.log
-results/perf.data*
+# Results (大文件)
+results/
 
 # hnswlib clone
 hnswlib/
@@ -30,3 +28,8 @@ hnswlib/
 # Temp
 /tmp/
 *.tmp
+
+# 文档类 — 只本地维护，不上库
+docs/
+*.md
+!README.md
