@@ -2,13 +2,16 @@ ARCH ?= $(shell uname -m)
 NUMA_PREFIX ?= $(HOME)/kumf/numactl-install
 
 CXX = g++ -std=c++14
-CFLAGS = -Wall -g -ggdb3 -O0 -fno-omit-frame-pointer -rdynamic -I$(NUMA_PREFIX)/include
+CFLAGS = -Wall -g -ggdb3 -O0 -fno-omit-frame-pointer -rdynamic
 
-ifeq ($(ARCH),aarch64)
-CFLAGS += -DARM64
+# 优先使用系统 libnuma
+ifeq ($(wildcard /usr/include/numa.h),/usr/include/numa.h)
+  LDFLAGS = -lnuma -ldl -lpthread
+else
+  NUMA_PREFIX ?= $(HOME)/kumf/numactl-install
+  CFLAGS += -I$(NUMA_PREFIX)/include
+  LDFLAGS = -L$(NUMA_PREFIX)/lib -lnuma -ldl -lpthread -Wl,-rpath,$(NUMA_PREFIX)/lib
 endif
-
-LDFLAGS = -L$(NUMA_PREFIX)/lib -lnuma -ldl -lpthread -Wl,-rpath,$(NUMA_PREFIX)/lib
 
 .PHONY: all clean
 all: ldlib.so

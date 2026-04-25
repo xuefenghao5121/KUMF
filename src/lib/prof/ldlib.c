@@ -72,10 +72,10 @@ static int __thread _in_trace = 0;
 #endif
 
 static __attribute__((unused)) int in_first_dlsym = 0;
-static char empty_data[32];
+static char empty_data[65536];  /* dlsym may need larger calloc during init */
 
 static void *(*libc_malloc)(size_t);
-static void *(*libc_calloc)(size_t, size_t);
+static void *(*libc_calloc)(size_t, size_t) = nullptr;  // 避免重复初始化
 static void *(*libc_realloc)(void *, size_t);
 static void (*libc_free)(void *);
 

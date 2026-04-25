@@ -10,7 +10,7 @@ makefile.dep: *.[Cch]
 -include makefile.dep
 
 ldlib.so: ldlib.c
-	g++ -fPIC ${CFLAGS} -c ldlib.c
+	g++ -std=c++14 -fPIC ${CFLAGS} -c ldlib.c
 	g++ -shared -Wl,-soname,libpmalloc.so -o ldlib.so ldlib.o -ldl -lpthread -lnuma
 
 clean:
