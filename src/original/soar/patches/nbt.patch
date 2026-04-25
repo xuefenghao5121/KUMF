@@ -1,0 +1,277 @@
+diff --git a/arch/x86/events/intel/ds.c b/arch/x86/events/intel/ds.c
+index 376cc3d66094..4bdc420fce9f 100644
+--- a/arch/x86/events/intel/ds.c
++++ b/arch/x86/events/intel/ds.c
+@@ -19,6 +19,9 @@ DEFINE_PER_CPU_PAGE_ALIGNED(struct debug_store, cpu_debug_store);
+ 
+ #define PEBS_FIXUP_SIZE		PAGE_SIZE
+ 
++#define CREATE_TRACE_POINTS
++#include <trace/events/pebs.h>
++
+ /*
+  * pebs_record_32 for p4 and core not supported
+ 
+@@ -1597,6 +1600,8 @@ static void setup_pebs_fixed_sample_data(struct perf_event *event,
+ 
+ 	if (has_branch_stack(event))
+ 		data->br_stack = &cpuc->lbr_stack;
++
++	trace_pebs(pebs->ip, pebs->dla, pebs->tsc);
+ }
+ 
+ static void adaptive_pebs_save_regs(struct pt_regs *regs,
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index a8911b1f35aa..01c867057265 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1286,6 +1286,9 @@ struct task_struct {
+ 	unsigned long			numa_faults_locality[3];
+ 
+ 	unsigned long			numa_pages_migrated;
++
++	unsigned long			numa_balancing_page_cnt;
++	unsigned long			numa_balancing_page_promote_cnt;
+ #endif /* CONFIG_NUMA_BALANCING */
+ 
+ #ifdef CONFIG_RSEQ
+diff --git a/include/linux/sched/sysctl.h b/include/linux/sched/sysctl.h
+index c1076b5e17fb..f01b1cc3ac1b 100644
+--- a/include/linux/sched/sysctl.h
++++ b/include/linux/sched/sysctl.h
+@@ -29,6 +29,11 @@ enum sched_tunable_scaling {
+ 
+ #ifdef CONFIG_NUMA_BALANCING
+ extern int sysctl_numa_balancing_mode;
++extern unsigned int sysctl_numa_balancing_disable_migrate;
++extern unsigned int sysctl_numa_balancing_page_promote_scale;
++extern unsigned int sysctl_numa_balancing_reset_kswapd_failures;
++extern unsigned int sysctl_numa_balancing_disable_pte;
++extern unsigned int sysctl_numa_balancing_pte_scale;
+ #else
+ #define sysctl_numa_balancing_mode	0
+ #endif
+diff --git a/include/trace/events/pebs.h b/include/trace/events/pebs.h
+new file mode 100644
+index 000000000000..18f5857a2846
+--- /dev/null
++++ b/include/trace/events/pebs.h
+@@ -0,0 +1,31 @@
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM pebs
++
++#if !defined(_TRACE_PEBS_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_PEBS_H
++
++#include <linux/tracepoint.h>
++
++TRACE_EVENT(pebs,
++		TP_PROTO(u64 ip, u64 dla, u64 tsc),
++		TP_ARGS(ip, dla, tsc),
++		TP_STRUCT__entry(
++			__field(u64, ip)
++			__field(u64, dla)
++			__field(u64, tsc)
++			),
++		TP_fast_assign(
++			__entry->ip = ip;
++			__entry->dla = dla;
++			__entry->tsc = tsc;
++			),
++		TP_printk("ip: %llx, dla: %llx, tsc: %llx",
++			__entry->ip,
++			__entry->dla,
++			__entry->tsc
++			)
++	   );
++
++#endif
++
++#include <trace/define_trace.h>
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index a68482d66535..c024c893a56d 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1058,6 +1058,14 @@ unsigned int sysctl_numa_balancing_scan_size = 256;
+ /* Scan @scan_size MB every @scan_period after an initial @scan_delay in ms */
+ unsigned int sysctl_numa_balancing_scan_delay = 1000;
+ 
++unsigned int sysctl_numa_balancing_disable_migrate = 0;
++
++unsigned int numa_balancing_page_cnt_limit = 10;
++unsigned int sysctl_numa_balancing_page_promote_scale = 10;
++
++unsigned int sysctl_numa_balancing_reset_kswapd_failures = 0;
++unsigned int sysctl_numa_balancing_disable_pte = 0;
++
+ struct numa_group {
+ 	refcount_t refcount;
+ 
+@@ -1410,6 +1418,33 @@ bool should_numa_migrate_memory(struct task_struct *p, struct page * page,
+ 	this_cpupid = cpu_pid_to_cpupid(dst_cpu, current->pid);
+ 	last_cpupid = page_cpupid_xchg_last(page, this_cpupid);
+ 
++	if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) {
++		if (sysctl_numa_balancing_disable_migrate) {
++			return false;
++		}
++		if (sysctl_numa_balancing_page_promote_scale > numa_balancing_page_cnt_limit) {
++			return true;
++		}
++		if (p->numa_balancing_page_promote_cnt < sysctl_numa_balancing_page_promote_scale) {
++			p->numa_balancing_page_cnt += 1;
++			p->numa_balancing_page_promote_cnt += 1;
++			if (p->numa_balancing_page_cnt == numa_balancing_page_cnt_limit) {
++				p->numa_balancing_page_cnt = 0;
++				p->numa_balancing_page_promote_cnt = 0;
++			}
++			return true;
++		}
++		if (p->numa_balancing_page_cnt < numa_balancing_page_cnt_limit) {
++			p->numa_balancing_page_cnt += 1;
++			if (p->numa_balancing_page_cnt == numa_balancing_page_cnt_limit) {
++				p->numa_balancing_page_cnt = 0;
++				p->numa_balancing_page_promote_cnt = 0;
++			}
++			return false;
++		}
++		return false;
++	}
++
+ 	/*
+ 	 * Allow first faults or private faults to migrate immediately early in
+ 	 * the lifetime of a task. The magic number 4 is based on waiting for
+@@ -2712,6 +2747,31 @@ static void reset_ptenuma_scan(struct task_struct *p)
+ 	p->mm->numa_scan_offset = 0;
+ }
+ 
++unsigned int sysctl_numa_balancing_pte_scale = 16;
++unsigned int numa_balancing_pte_scale_max = 16;
++static unsigned long change_prot_numa_scale(struct vm_area_struct *vma,
++		                        unsigned long addr, unsigned long end, unsigned long *end_p)
++{
++	int nr_updated;
++	unsigned long end_n;
++	unsigned long size_n;
++	if (sysctl_numa_balancing_pte_scale >= numa_balancing_pte_scale_max) {
++		end_n = end;
++	} else {
++		if (end > addr) {
++			size_n = end - addr;
++			end_n = addr + (size_n / numa_balancing_pte_scale_max) * sysctl_numa_balancing_pte_scale;
++			end_n = ALIGN(end_n, HPAGE_SIZE);
++			*end_p = end_n;
++			if (end_n - addr < HPAGE_SIZE) {
++				return nr_updated;
++			}
++		}
++	}
++	nr_updated = change_prot_numa(vma, addr, end_n);
++	return nr_updated;
++}
++
+ /*
+  * The expensive part of numa migration is done from task_work context.
+  * Triggered from task_tick_numa().
+@@ -2724,6 +2784,7 @@ static void task_numa_work(struct callback_head *work)
+ 	u64 runtime = p->se.sum_exec_runtime;
+ 	struct vm_area_struct *vma;
+ 	unsigned long start, end;
++	unsigned long end_n;
+ 	unsigned long nr_pte_updates = 0;
+ 	long pages, virtpages;
+ 
+@@ -2811,7 +2872,10 @@ static void task_numa_work(struct callback_head *work)
+ 			start = max(start, vma->vm_start);
+ 			end = ALIGN(start + (pages << PAGE_SHIFT), HPAGE_SIZE);
+ 			end = min(end, vma->vm_end);
+-			nr_pte_updates = change_prot_numa(vma, start, end);
++			end_n = end;
++			if (sysctl_numa_balancing_disable_pte == 0) {
++				nr_pte_updates = change_prot_numa_scale(vma, start, end, &end_n);
++			}
+ 
+ 			/*
+ 			 * Try to scan sysctl_numa_balancing_size worth of
+@@ -2822,8 +2886,8 @@ static void task_numa_work(struct callback_head *work)
+ 			 * areas faster.
+ 			 */
+ 			if (nr_pte_updates)
+-				pages -= (end - start) >> PAGE_SHIFT;
+-			virtpages -= (end - start) >> PAGE_SHIFT;
++				pages -= (end_n - start) >> PAGE_SHIFT;
++			virtpages -= (end_n - start) >> PAGE_SHIFT;
+ 
+ 			start = end;
+ 			if (pages <= 0 || virtpages <= 0)
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 830aaf8ca08e..bf688ace2b25 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -1698,6 +1698,46 @@ static struct ctl_table kern_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_FOUR,
+ 	},
++	{
++		.procname	= "numa_balancing_disable_migrate",
++		.data		= &sysctl_numa_balancing_disable_migrate,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++	},
++	{
++		.procname	= "numa_balancing_page_promote_scale",
++		.data		= &sysctl_numa_balancing_page_promote_scale,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++	},
++	{
++		.procname	= "numa_balancing_reset_kswapd_failures",
++		.data		= &sysctl_numa_balancing_reset_kswapd_failures,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++	},
++	{
++		.procname	= "numa_balancing_disable_pte",
++		.data		= &sysctl_numa_balancing_disable_pte,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++	},
++	{
++		.procname	= "numa_balancing_pte_scale",
++		.data		= &sysctl_numa_balancing_pte_scale,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++	},
+ #endif /* CONFIG_NUMA_BALANCING */
+ 	{
+ 		.procname	= "sched_rt_period_us",
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 6c31ee1e1c9b..28891a442d27 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -2032,9 +2032,14 @@ static int numamigrate_isolate_page(pg_data_t *pgdat, struct page *page)
+ 		if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING))
+ 			return 0;
+ 		for (z = pgdat->nr_zones - 1; z >= 0; z--) {
+-			if (populated_zone(pgdat->node_zones + z))
++			if (populated_zone(pgdat->node_zones + z)) {
+ 				break;
++			}
++		}
++		if (sysctl_numa_balancing_reset_kswapd_failures) {
++			pgdat->kswapd_failures = 0;
+ 		}
++	
+ 		wakeup_kswapd(pgdat->node_zones + z, 0, order, ZONE_MOVABLE);
+ 		return 0;
+ 	}
