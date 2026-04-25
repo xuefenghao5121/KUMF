@@ -183,13 +183,20 @@ class SPEParser:
 
     @classmethod
     def _parse_pebs(cls, filepath: str) -> Tuple[List[SampleRecord], int]:
+        """Parse x86 PEBS perf script output from 'perf mem record'
+
+        Format: comm TID [CPU] TS: WEIGHT EVENT: VA EXTRA |OP LOAD/STORE|LVL ...|SYM (DSO)
+        Example:
+          gmx 1234 [012] 123.456: 2559 cpu_core/mem-loads/P: 709174661190 ... |OP LOAD|LVL L1 hit|...
+        """
         records = []
         errors = 0
         with open(filepath, 'r', errors='replace') as f:
-            for line in f:
+            for line_no, line in enumerate(f, 1):
                 line = line.strip()
                 if not line or line.startswith('#') or line.startswith('Only'):
                     continue
+
                 parts = line.split()
                 if len(parts) < 8:
                     errors += 1
@@ -199,26 +206,72 @@ class SPEParser:
                     cpu = int(parts[2].strip('[]'))
                     ts = float(parts[3].rstrip(':'))
                     weight = int(parts[4]) if parts[4].isdigit() else 0
-                    event_type = 'load' if 'mem-loads' in line else 'store'
+
+                    # Detect event type
+                    event_field = parts[5] if len(parts) > 5 else ""
+                    if 'mem-loads' in event_field or 'mem-load' in event_field:
+                        event_type = 'load'
+                    elif 'mem-stores' in event_field or 'mem-store' in event_field:
+                        event_type = 'store'
+                    else:
+                        event_type = 'unknown'
+
+                    # Data address: after the event field (field after ':')
+                    # Format: EVENT: VA  (the ':' is part of field 5, VA is field 6)
                     va = 0
-                    sym = ""
-                    dso = ""
-                    # Find data address (hex after event field)
-                    for i in range(5, len(parts)):
-                        p = parts[i]
-                        if len(p) >= 12 and all(c in '0123456789abcdefABCDEF' for c in p):
-                            va = int(p, 16)
-                            rest = ' '.join(parts[i+1:])
-                            if '(' in rest:
-                                sym = rest.split('(')[0].strip()
-                                dso = rest.split('(')[1].split(')')[0]
-                            break
+                    va_str = parts[6] if len(parts) > 6 else ""
+                    if va_str:
+                        try:
+                            va = int(va_str, 16)
+                        except ValueError:
+                            try:
+                                va = int(va_str)
+                            except ValueError:
+                                errors += 1
+                                continue
                     if va == 0:
                         errors += 1
                         continue
+
+                    # Parse LVL field from the line to determine cache level
+                    # Format: ...|LVL L3 miss|... or ...|LVL L1 hit|...
+                    lvl_match = re.search(r'\|LVL\s+([^|]+)\|', line)
+                    llc_miss = False
+                    dram_access = False
+                    if lvl_match:
+                        lvl_str = lvl_match.group(1).strip()
+                        if 'L3 miss' in lvl_str or 'RAM' in lvl_str or 'Remote' in lvl_str:
+                            llc_miss = True
+                        if 'RAM' in lvl_str or 'Remote' in lvl_str:
+                            dram_access = True
+
+                    # Latency: weight field or from ldlat
+                    # NOTE: perf mem weight field is sample weight, NOT latency.
+                    # Actual latency info is in the LVL field and the numeric fields after LVL.
+                    # For mem-loads with ldlat, there may be a latency value, but not in weight.
+                    latency_ns = 0  # Do NOT use weight as latency
+
+                    # Symbol and DSO: last fields in parens
+                    sym = ""
+                    dso = ""
+                    # Find last '(' for DSO
+                    for i in range(len(parts) - 1, 6, -1):
+                        if '(' in parts[i]:
+                            dso = parts[i].strip('()')
+                            # Symbol is the field before DSO
+                            if i > 7:
+                                sym = parts[i-1]
+                            break
+
+                    # Update event type based on LLC info
+                    if llc_miss:
+                        event_type = 'llc_miss'
+                    elif dram_access:
+                        event_type = 'dram'
+
                     rec = SampleRecord(
                         pid=tid, tid=tid, cpu=cpu, timestamp=ts,
-                        va=va, weight=weight, event_type=event_type,
+                        va=va, weight=latency_ns, event_type=event_type,
                         symbol=sym, dso=dso,
                     )
                     records.append(rec)
@@ -335,13 +388,22 @@ class PageAnalyzer:
             if page_key not in pages:
                 pages[page_key] = PageInfo(page_addr=page_key << self.PAGE_SHIFT)
             p = pages[page_key]
+            # Count by type - handle both ARM SPE and x86 PEBS events
             if rec.event_type in ('load', 'l1d_hit', 'l2_hit', 'llc_hit'):
                 p.loads += 1
             elif rec.event_type == 'store':
                 p.stores += 1
+            elif rec.event_type == 'llc_miss':
+                p.loads += 1
+                p.llc_misses += 1
+            elif rec.event_type == 'dram':
+                p.loads += 1
+                p.llc_misses += 1
+                p.memory_accesses += 1
+            # ARM SPE specific
             if 'miss' in rec.event_type and 'l1d' in rec.event_type:
                 p.l1d_misses += 1
-            if 'llc_miss' in rec.event_type:
+            if 'llc_miss' in rec.event_type and rec.event_type not in ('llc_miss',):
                 p.llc_misses += 1
             if rec.event_type == 'dram':
                 p.memory_accesses += 1
@@ -360,10 +422,9 @@ class PageAnalyzer:
         p.total_accesses = p.loads + p.stores
         if p.total_accesses == 0:
             return
-        # LLC miss ratio
-        total_cache = p.l1d_misses + p.llc_misses + p.memory_accesses
-        if total_cache > 0:
-            p.llc_miss_ratio = (p.llc_misses + p.memory_accesses) / total_cache
+        # LLC miss ratio — based on loads only (stores don't have LVL info in PEBS)
+        if p.loads > 0:
+            p.llc_miss_ratio = (p.llc_misses + p.memory_accesses) / p.loads
         elif p.latency_sum > 0:
             p.avg_latency = p.latency_sum / p.total_accesses
             # Platform-adaptive latency threshold for LLC miss estimation
