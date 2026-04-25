@@ -29,11 +29,13 @@
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
 #include <asm/unistd.h>
+#include <sys/stat.h>
 #include <pthread.h>
 
 #define MAX_CPUS 160
 #define BUF_SIZE (256 * 1024)  /* 256KB per CPU buffer */
-#define OUTPUT_PATH "/tmp/kumf/spe_self_profile.txt"
+#define OUTPUT_DIR "/tmp/kumf"
+#define OUTPUT_TEMPLATE "/tmp/kumf/spe_self_profile_%d.txt"
 
 static int perf_fds[MAX_CPUS];
 static int n_cpus = 0;
@@ -59,7 +61,7 @@ static int get_spe_pmu_type(void) {
         if (!f) return -1;
     }
     int type = -1;
-    fscanf(f, "%d", &type);
+    if (fscanf(f, "%d", &type) != 1) type = -1;
     fclose(f);
     return type;
 }
@@ -74,9 +76,8 @@ static int read_format_bits(const char *name) {
     snprintf(path, sizeof(path),
              "/sys/bus/event_source/devices/arm_spe_0/format/%s", name);
     FILE *f = fopen(path, "r");
-    if (!f) return 0;
+    if (!f) return -1;  /* -1 = file not found, caller should skip */
     int bits = 0;
-    /* Format: "config:N" or "config1:N" */
     char buf[64];
     if (fgets(buf, sizeof(buf), f)) {
         char *colon = strchr(buf, ':');
@@ -91,14 +92,15 @@ static int read_format_bits(const char *name) {
 static long long spe_event_config(int load, int store, int min_latency) {
     long long config = 0;
 
-    /* 读取 format bits */
     int load_bit = read_format_bits("load_filter");
     int store_bit = read_format_bits("store_filter");
     int latency_bit = read_format_bits("min_latency");
 
-    if (load) config |= (1LL << load_bit);
-    if (store) config |= (1LL << store_bit);
-    if (min_latency > 0) config |= ((long long)min_latency << latency_bit);
+    /* Only set bits if the format file exists */
+    if (load && load_bit >= 0) config |= (1LL << load_bit);
+    if (store && store_bit >= 0) config |= (1LL << store_bit);
+    if (min_latency > 0 && latency_bit >= 0)
+        config |= ((long long)min_latency << latency_bit);
 
     return config;
 }
@@ -250,6 +252,7 @@ static void *profile_thread_fn(void *arg) {
     /* Poll loop */
     struct timespec ts = {1, 0};  /* 1 second interval */
     int total_samples = 0;
+    (void)total_samples;
 
     while (profiling_active) {
         nanosleep(&ts, NULL);
@@ -284,9 +287,12 @@ static void *profile_thread_fn(void *arg) {
 void spe_profile_start(void) {
     if (profiling_active) return;
 
-    output_file = fopen(OUTPUT_PATH, "w");
+    mkdir(OUTPUT_DIR, 0755);
+    char outpath[256];
+    snprintf(outpath, sizeof(outpath), OUTPUT_TEMPLATE, getpid());
+    output_file = fopen(outpath, "w");
     if (!output_file) {
-        fprintf(stderr, "[SPE] Cannot open %s: %s\n", OUTPUT_PATH, strerror(errno));
+        fprintf(stderr, "[SPE] Cannot open %s: %s\n", outpath, strerror(errno));
         return;
     }
 
@@ -311,13 +317,15 @@ void spe_profile_stop(void) {
 
 /* ---- Wrapper Mode (main) ---- */
 
+static volatile sig_atomic_t child_exited = 0;
+
 static void sigchld_handler(int sig) {
     (void)sig;
-    spe_profile_stop();
+    child_exited = 1;  /* 只设置标志，不在 signal handler 中调用非 async-signal-safe 函数 */
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2 || strcmp(argv[1], "--") == 0 && argc < 3) {
+    if (argc < 2) {
         fprintf(stderr, "Usage: %s -- <command> [args...]\n", argv[0]);
         fprintf(stderr, "       %s --pid <PID>           # attach to running process\n", argv[0]);
         return 1;
@@ -326,15 +334,9 @@ int main(int argc, char *argv[]) {
     mkdir("/tmp/kumf", 0755);
 
     if (strcmp(argv[1], "--pid") == 0 && argc >= 3) {
-        /* Attach mode: profile existing process by PID
-         * Note: paranoid=2 allows profiling own processes (same UID)
-         */
         pid_t target_pid = atoi(argv[2]);
-        fprintf(stderr, "[SPE] Attaching to PID %d (must be same user)\n", target_pid);
-
-        /* For attach mode, we'd need to set pid in perf_event_open */
-        /* This is a simplified version - full implementation would modify profile_thread_fn */
-        fprintf(stderr, "[SPE] Attach mode: use LD_PRELOAD instead for full SPE capture\n");
+        fprintf(stderr, "[SPE] Attach mode not yet supported. Use LD_PRELOAD instead.\n");
+        (void)target_pid;
         return 1;
     }
 
@@ -343,7 +345,6 @@ int main(int argc, char *argv[]) {
 
     pid_t child = fork();
     if (child == 0) {
-        /* Child: exec the target workload */
         int cmd_start = (strcmp(argv[1], "--") == 0) ? 2 : 1;
         execvp(argv[cmd_start], &argv[cmd_start]);
         perror("execvp");
@@ -353,7 +354,9 @@ int main(int argc, char *argv[]) {
     /* Parent: profile the child */
     fprintf(stderr, "[SPE] Child PID=%d, starting profiling...\n", child);
 
-    output_file = fopen(OUTPUT_PATH, "w");
+    char outpath[256];
+    snprintf(outpath, sizeof(outpath), OUTPUT_TEMPLATE, child);
+    output_file = fopen(outpath, "w");
     if (!output_file) {
         perror("fopen");
         return 1;
@@ -362,9 +365,6 @@ int main(int argc, char *argv[]) {
     fprintf(output_file, "# Target PID=%d\n", child);
     fprintf(output_file, "#\n");
 
-    /* For wrapper mode, we profile the child PID
-     * perf_event_paranoid=2 allows this for same-UID processes
-     */
     profiling_active = 1;
 
     /* Open SPE for child PID */
@@ -413,9 +413,8 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "[SPE] Active on %d/%d CPUs\n", active_cpus, n_cpus);
 
     /* Poll until child exits */
-    int status;
+    int status = 0;
     while (1) {
-        /* Drain buffers every 500ms */
         struct timespec ts = {0, 500000000};
         nanosleep(&ts, NULL);
 
@@ -424,7 +423,10 @@ int main(int argc, char *argv[]) {
             parse_spe_buffer(mmap_headers[i], i);
         }
 
-        /* Check if child still running */
+        if (child_exited) {
+            waitpid(child, &status, 0);
+            break;
+        }
         pid_t ret = waitpid(child, &status, WNOHANG);
         if (ret == child) break;
         if (ret < 0 && errno == ECHILD) break;
@@ -441,7 +443,7 @@ int main(int argc, char *argv[]) {
     }
 
     fclose(output_file);
-    fprintf(stderr, "[SPE] Done. Output: %s\n", OUTPUT_PATH);
+    fprintf(stderr, "[SPE] Done. Output: %s\n", outpath);
 
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }

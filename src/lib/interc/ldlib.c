@@ -22,6 +22,7 @@
 #include <new>
 #include <sys/types.h>
 #include <sys/syscall.h>
+#include <pthread.h>
 #include <numa.h>
 
 /* ---- Configuration ---- */
@@ -94,9 +95,12 @@ static int num_addr_rules = 0;
 static struct name_rule name_rules[MAX_NAME_RULES];
 static int num_name_rules = 0;
 static int rules_loaded = 0;
+static pthread_mutex_t rules_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void load_rules(void) {
     if (rules_loaded) return;
+    pthread_mutex_lock(&rules_lock);
+    if (rules_loaded) { pthread_mutex_unlock(&rules_lock); return; }
     rules_loaded = 1;
     const char *conf = getenv("KUMF_CONF");
     if (!conf) conf = "kumf.conf";
@@ -122,6 +126,8 @@ static void load_rules(void) {
         }
     }
     fclose(f);
+    rules_loaded = 1;
+    pthread_mutex_unlock(&rules_lock);
 }
 
 static int match_addr(void *caller) {
@@ -177,6 +183,17 @@ extern "C" void *calloc(size_t nmemb, size_t size)
 extern "C" void *realloc(void *ptr, size_t size)
 {
     if (!libc_realloc) { libc_realloc = (void *(*)(void *, size_t))dlsym(RTLD_NEXT, "realloc"); }
+    if (!ptr) return malloc(size);
+    size_t old_sz = check_and_remove_seg((unsigned long)ptr);
+    if (old_sz > 0) {
+        /* Was a numa allocation - must manually realloc */
+        void *new_addr = malloc(size);
+        if (new_addr) {
+            memcpy(new_addr, ptr, old_sz < size ? old_sz : size);
+            numa_free(ptr, old_sz);
+        }
+        return new_addr;
+    }
     return libc_realloc(ptr, size);
 }
 

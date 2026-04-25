@@ -195,7 +195,7 @@ extern "C" void *calloc(size_t nmemb, size_t size)
 {
     void *addr;
     if (!libc_calloc) {
-        memset(empty_data, 0, sizeof(*empty_data));
+        memset(empty_data, 0, sizeof(empty_data));
         addr = empty_data;
     } else {
         addr = libc_calloc(nmemb, size);
@@ -333,7 +333,7 @@ extern "C" void *mmap64(void *start, size_t length, int prot, int flags, int fd,
         if (log_arr) {
             rdtscll(log_arr->rdt);
             log_arr->addr = addr;
-            log_arr->size = length * 4 * 1024;
+            log_arr->size = length;
             log_arr->entry_type = flags + 200;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
         }
@@ -343,13 +343,18 @@ extern "C" void *mmap64(void *start, size_t length, int prot, int flags, int fd,
 
 extern "C" int munmap(void *start, size_t length)
 {
-    int addr = libc_munmap(start, length);
-    struct log log_arr;
-    rdtscll(log_arr.rdt);
-    log_arr.addr = start;
-    log_arr.size = length;
-    log_arr.entry_type = 90;
-    return addr;
+    int ret = libc_munmap(start, length);
+    if (!_in_trace && libc_free) {
+        struct log *l = get_log();
+        if (l) {
+            rdtscll(l->rdt);
+            l->addr = start;
+            l->size = length;
+            l->entry_type = 90;
+            get_trace(&l->callchain_size, l->callchain_strings);
+        }
+    }
+    return ret;
 }
 
 int __thread bye_done = 0;
