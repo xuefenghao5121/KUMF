@@ -26,6 +26,10 @@
 #define CALLCHAIN_SIZE      5      /* stack trace length */
 #define RESOLVE_SYMBS       1      /* Resolve symbols at the end of the execution; quite costly */
 
+/* Debug: set KUMF_PROF_DEBUG=1 to dump backtrace info to stderr at exit */
+static int kumf_prof_debug = -1;
+#define PROF_DEBUG(fmt, ...) do { if (kumf_prof_debug == 1) fprintf(stderr, "[PROF] " fmt "\n", ##__VA_ARGS__); } while(0)
+
 #define NB_ALLOC_TO_IGNORE   0     /* Ignore the first X allocations. */
 #define IGNORE_FIRST_PROCESS 0     /* Ignore the first process (and all its threads). Useful for processes */
 
@@ -371,7 +375,12 @@ void __attribute__((destructor)) bye(void)
         return;
     bye_done = 1;
 
+    /* Init debug flag */
+    if (kumf_prof_debug < 0)
+        kumf_prof_debug = getenv("KUMF_PROF_DEBUG") ? 1 : 0;
+
     unsigned int i, j, k;
+    int backtrace_ok = 0;
     for (i = 1; i < MAX_TID; i++) {
         if (tids[i] == 0)
             break;
@@ -383,6 +392,11 @@ void __attribute__((destructor)) bye(void)
             char **strings = backtrace_symbols (l->callchain_strings, l->callchain_size);
             if (l->callchain_size >= 4) {
                 fprintf (dump, "%s ", strings[3]);
+                backtrace_ok = 1;
+            } else if (l->callchain_size > 0) {
+                fprintf(dump, "[bt=%zu] ", l->callchain_size);
+            } else {
+                fprintf(dump, "[no-bt] ");
             }
 
             libc_free(strings);
@@ -394,6 +408,16 @@ void __attribute__((destructor)) bye(void)
             fprintf(dump, "%lu %lu %lx %d\n", l->rdt, (long unsigned)l->size, (long unsigned)l->addr, (int)l->entry_type);
         }
         fclose(dump);
+    }
+
+    /* Debug: report backtrace status */
+    if (kumf_prof_debug) {
+        PROF_DEBUG("Total threads: %d, backtrace_ok=%d", i-1, backtrace_ok);
+        if (!backtrace_ok) {
+            PROF_DEBUG("WARNING: backtrace returned < 4 frames.");
+            PROF_DEBUG("ARM64 needs -fno-omit-frame-pointer or libunwind.");
+            PROF_DEBUG("Try: gcc -fno-omit-frame-pointer ...");
+        }
     }
 }
 

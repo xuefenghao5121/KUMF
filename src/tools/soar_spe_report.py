@@ -16,13 +16,84 @@ ARM SPE 在鲲鹏930上的特点：
 """
 
 import argparse
+import os
 import re
 import csv
 import sys
+import subprocess
 from collections import defaultdict
 from dataclasses import dataclass, field
 
 PAGE_SIZE = 4096  # 4KB pages
+
+def detect_numa_topology():
+    """Auto-detect NUMA topology from numactl -H or /sys.
+    Returns (fast_nodes, slow_nodes, numa_distances).
+    Strategy: same-socket nodes = fast, cross-socket = slow.
+    """
+    fast_nodes = [0]
+    slow_nodes = [1]
+    numa_distances = {}
+
+    # Method 1: parse numactl -H
+    try:
+        result = subprocess.run(['numactl', '-H'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            nodes = []
+            distances = {}
+            current_node = None
+            for line in result.stdout.strip().split('\n'):
+                line = line.strip()
+                if line.startswith('available:'):
+                    # Parse available nodes from "available: 4 nodes (0-3)"
+                    parts = line.split()
+                    if len(parts) >= 3 and '(' in parts[2]:
+                        rng = parts[2].strip('()')
+                        if '-' in rng:
+                            start, end = map(int, rng.split('-'))
+                            nodes = list(range(start, end+1))
+                    if nodes:
+                        continue
+                
+                # Parse "node X distance: Y Y Y Y ..."
+                if line.startswith('node ') and 'distance' in line:
+                    parts = line.split()
+                    src = int(parts[1])
+                    vals = list(map(int, parts[3:]))
+                    distances[src] = vals
+            
+            if nodes and distances:
+                # Find local distance for first node
+                local_dist = distances.get(nodes[0], [10])[0]
+                fast_nodes = []
+                slow_nodes = []
+                for node_id in nodes:
+                    d = distances.get(node_id, [999])[0]
+                    if d <= local_dist:
+                        fast_nodes.append(node_id)
+                    elif d > local_dist:
+                        slow_nodes.append(node_id)
+                numa_distances = distances
+                print(f"NUMA topology: {len(nodes)} nodes, fast={fast_nodes}, slow={slow_nodes}")
+                return fast_nodes, slow_nodes, numa_distances
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Method 2: parse /sys/devices/system/node/has_cpu
+    try:
+        sys_nodes = []
+        for entry in os.listdir('/sys/devices/system/node/'):
+            if entry.startswith('node') and entry[4:].isdigit():
+                sys_nodes.append(int(entry[4:]))
+        if sys_nodes:
+            nodes = sorted(sys_nodes)
+            fast_nodes = [nodes[0]]
+            slow_nodes = nodes[1:2] if len(nodes) > 1 else []
+            print(f"NUMA topology (fallback /sys): {len(nodes)} nodes, fast={fast_nodes}, slow={slow_nodes}")
+    except (FileNotFoundError, ValueError):
+        pass
+
+    return fast_nodes, slow_nodes, numa_distances
 
 @dataclass
 class PageInfo:
@@ -159,28 +230,36 @@ def compute_aol(pages: dict, top_pct: float = 0.2):
     
     print(f"Classified {len(sorted_pages)} pages: {fast_count} FAST, {len(sorted_pages) - fast_count} SLOW")
 
-def generate_interc_config(pages: dict, output_path: str):
+def generate_interc_config(pages: dict, output_path: str, fast_nodes: list = None, slow_nodes: list = None):
     """Generate interc configuration from tier classification"""
     fast_pages = [p for p in pages.values() if p.tier == "FAST"]
     slow_pages = [p for p in pages.values() if p.tier == "SLOW"]
+
+    if fast_nodes is None:
+        fast_nodes = [0]
+    if slow_nodes is None:
+        slow_nodes = [1] if fast_nodes else [1]
     
+    fast_node = fast_nodes[0]
+    slow_node = slow_nodes[0] if slow_nodes else (fast_node + 1)
+
     with open(output_path, 'w') as f:
         f.write("# KUMF interc configuration - auto-generated from SOAR SPE analysis\n")
-        f.write("# Format: address_range = NUMA_node\n")
-        f.write("# FAST tier → Node 0 (local, low latency)\n")
-        f.write("# SLOW tier → Node 2 (remote, high latency)\n\n")
-        
-        f.write("# ===== FAST tier (hot pages) → Node 0 =====\n")
+        f.write(f"# NUMA topology: fast={fast_nodes}, slow={slow_nodes}\n")
+        f.write(f"# FAST tier → Node {fast_node} (local, low latency)\n")
+        f.write(f"# SLOW tier → Node {slow_node} (remote, high latency)\n\n")
+
+        f.write(f"# ===== FAST tier (hot pages) → Node {fast_node} =====\n")
         for page in sorted(fast_pages, key=lambda p: p.page_addr):
             addr_start = page.page_addr
             addr_end = page.page_addr + PAGE_SIZE - 1
-            f.write(f"0x{addr_start:016x}-0x{addr_end:016x} = 0\n")
-        
-        f.write(f"\n# ===== SLOW tier (cold pages) → Node 2 =====\n")
+            f.write(f"0x{addr_start:016x}-0x{addr_end:016x} = {fast_node}\n")
+
+        f.write(f"\n# ===== SLOW tier (cold pages) → Node {slow_node} =====\n")
         for page in sorted(slow_pages, key=lambda p: p.page_addr):
             addr_start = page.page_addr
             addr_end = page.page_addr + PAGE_SIZE - 1
-            f.write(f"0x{addr_start:016x}-0x{addr_end:016x} = 2\n")
+            f.write(f"0x{addr_start:016x}-0x{addr_end:016x} = {slow_node}\n")
 
 def output_csv(pages: dict, output_path: str):
     """Output page-level AOL CSV"""
@@ -214,6 +293,9 @@ def main():
     parser.add_argument('--top-pct', type=float, default=0.2, help='Top %% pages for FAST tier')
     args = parser.parse_args()
     
+    # Detect NUMA topology
+    fast_nodes, slow_nodes, numa_distances = detect_numa_topology()
+
     print(f"Parsing {args.report} for DSO={args.dso}...")
     pages = parse_report(args.report, args.dso)
     
@@ -240,7 +322,7 @@ def main():
               f"syms={';'.join(sorted(p.symbols))}")
     
     if args.config:
-        generate_interc_config(pages, args.config)
+        generate_interc_config(pages, args.config, fast_nodes, slow_nodes)
         print(f"\ninterc config written to {args.config}")
 
 if __name__ == '__main__':

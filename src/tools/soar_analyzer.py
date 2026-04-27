@@ -614,13 +614,13 @@ def print_report(pages, objects, pmu, total_samples, parse_errors):
     # SOAR migration plan
     if pages:
         sorted_pages = sorted(pages.values(), key=lambda p: p.aol_score, reverse=True)
-        print(f"\n--- SOAR Migration Plan (for kunpeng930) ---")
-        print(f"  # Hot pages -> FAST tier (Node 0-1)")
+        print(f"\n--- SOAR Migration Plan ---")
+        print(f"  # Hot pages -> FAST tier (local NUMA node)")
         for p in sorted_pages[:10]:
-            print(f"  migrate_page {p.page_addr:#018x} -> Node0  # AOL={p.aol_score:.2f} acc={p.total_accesses}")
-        print(f"  # Cold pages -> SLOW tier (Node 2-3)")
+            print(f"  migrate_page {p.page_addr:#018x} -> FAST  # AOL={p.aol_score:.2f} acc={p.total_accesses}")
+        print(f"  # Cold pages -> SLOW tier (remote NUMA node)")
         for p in sorted_pages[-5:]:
-            print(f"  migrate_page {p.page_addr:#018x} -> Node2  # AOL={p.aol_score:.2f} acc={p.total_accesses}")
+            print(f"  migrate_page {p.page_addr:#018x} -> SLOW  # AOL={p.aol_score:.2f} acc={p.total_accesses}")
 
 
 def write_csv(pages, objects, output_path):
