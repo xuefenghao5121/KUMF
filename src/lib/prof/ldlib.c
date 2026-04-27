@@ -23,7 +23,7 @@
 #define MAX_TID 512                /* Max number of tids to profile */
 
 #define USE_FRAME_POINTER   0      /* Use Frame Pointers to compute the stack trace (faster) */
-#define CALLCHAIN_SIZE      5      /* stack trace length */
+#define CALLCHAIN_SIZE      16     /* stack trace length (ARM needs deeper for backtrace) */
 #define RESOLVE_SYMBS       1      /* Resolve symbols at the end of the execution; quite costly */
 
 /* Debug: set KUMF_PROF_DEBUG=1 to dump backtrace info to stderr at exit */
@@ -54,6 +54,7 @@ struct log {
 
     size_t callchain_size;
     void *callchain_strings[CALLCHAIN_SIZE];
+    void *caller_addr;        /* __builtin_return_address(0) — direct caller of malloc, bypass PLT */
 };
 struct log *log_arr[MAX_TID];
 static size_t log_index[MAX_TID];
@@ -168,7 +169,7 @@ int get_trace(size_t *size, void **strings)
             break;
     }
 #else
-    *size = backtrace(strings, 10);
+    *size = backtrace(strings, CALLCHAIN_SIZE);
 #endif
     _in_trace = 0;
     return 0;
@@ -195,6 +196,7 @@ extern "C" void *malloc(size_t sz)
             log_arr->addr = addr;
             log_arr->size = sz;
             log_arr->entry_type = 1;
+            log_arr->caller_addr = __builtin_return_address(0);
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
         }
     }
@@ -217,6 +219,7 @@ extern "C" void *calloc(size_t nmemb, size_t size)
             log_arr->addr = addr;
             log_arr->size = nmemb * size;
             log_arr->entry_type = 3;
+            log_arr->caller_addr = __builtin_return_address(0);
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
         }
     }
@@ -390,20 +393,35 @@ void __attribute__((destructor)) bye(void)
             #if RESOLVE_SYMBS
             _in_trace = 1;
             char **strings = backtrace_symbols (l->callchain_strings, l->callchain_size);
-            if (l->callchain_size >= 4) {
-                fprintf (dump, "%s ", strings[3]);
-                backtrace_ok = 1;
-            } else if (l->callchain_size > 0) {
-                fprintf(dump, "[bt=%zu] ", l->callchain_size);
+            /* Output: caller_addr (via __builtin_return_address) + backtrace[5] */
+            Dl_info info;
+            char caller_sym[128] = {0};
+            if (dladdr(l->caller_addr, &info) && info.dli_sname) {
+                snprintf(caller_sym, sizeof(caller_sym), "%s+%p", info.dli_sname,
+                         (void*)((char*)l->caller_addr - (char*)info.dli_saddr));
             } else {
-                fprintf(dump, "[no-bt] ");
+                snprintf(caller_sym, sizeof(caller_sym), "[%p]", l->caller_addr);
             }
+            const char *bt_sym = "??";
+            if (l->callchain_size >= 6) {
+                bt_sym = strings[5];
+            } else if (l->callchain_size >= 4) {
+                bt_sym = strings[3];
+            }
+            fprintf(dump, "%s %s ", caller_sym, bt_sym);
+            backtrace_ok = 1;
 
             libc_free(strings);
             #else
-            if (l->callchain_size >= 4) {
-                fprintf (dump, "[%p] ", l->callchain_strings[3]);
+            Dl_info info;
+            char caller_sym[128] = {0};
+            if (dladdr(l->caller_addr, &info) && info.dli_sname) {
+                snprintf(caller_sym, sizeof(caller_sym), "%s+%p", info.dli_sname,
+                         (void*)((char*)l->caller_addr - (char*)info.dli_saddr));
+            } else {
+                snprintf(caller_sym, sizeof(caller_sym), "[%p]", l->caller_addr);
             }
+            fprintf(dump, "%s ", caller_sym);
             #endif
             fprintf(dump, "%lu %lu %lx %d\n", l->rdt, (long unsigned)l->size, (long unsigned)l->addr, (int)l->entry_type);
         }
