@@ -242,6 +242,7 @@ extern "C" void *realloc(void *ptr, size_t size)
             log_arr->addr = addr;
             log_arr->size = size;
             log_arr->entry_type = 4;
+            log_arr->caller_addr = __builtin_return_address(0);
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
         }
     }
@@ -258,6 +259,7 @@ extern "C" void *memalign(size_t align, size_t sz)
             log_arr->addr = addr;
             log_arr->size = sz;
             log_arr->entry_type = 5;
+            log_arr->caller_addr = __builtin_return_address(0);
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
         }
     }
@@ -274,6 +276,7 @@ extern "C" int posix_memalign(void **ptr, size_t align, size_t sz)
             log_arr->addr = *ptr;
             log_arr->size = sz;
             log_arr->entry_type = 6;
+            log_arr->caller_addr = __builtin_return_address(0);
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
         }
     }
@@ -400,7 +403,7 @@ static void prof_cleanup(void)
             #if RESOLVE_SYMBS
             _in_trace = 1;
             char **strings = (l->callchain_size > 0) ? backtrace_symbols(l->callchain_strings, l->callchain_size) : NULL;
-            /* Output: caller_addr (via __builtin_return_address) + backtrace[5] */
+            /* Output: caller_addr symbol (via __builtin_return_address, bypass PLT) */
             char caller_sym[128] = {0};
             if (l->caller_addr && l->caller_addr != (void*)-1L) {
                 Dl_info info;
@@ -413,14 +416,7 @@ static void prof_cleanup(void)
             } else {
                 snprintf(caller_sym, sizeof(caller_sym), "[init]");
             }
-            const char *bt_sym = "??";
-            if (strings) {
-                if (l->callchain_size >= 6)
-                    bt_sym = strings[5];
-                else if (l->callchain_size >= 4)
-                    bt_sym = strings[3];
-            }
-            fprintf(dump, "%s %s ", caller_sym, bt_sym);
+            fprintf(dump, "%s ", caller_sym);
             backtrace_ok = 1;
 
             if (strings) libc_free(strings);
