@@ -1,35 +1,13 @@
-# .gitignore
-
-# Build
-build/
+# 编译产物
 *.o
 *.so
 *.a
-bench
-hnswlib_bench
-mini_md
+*.pyc
+__pycache__/
+
+# SPE 数据
+/tmp/kumf/
 
 # IDE
 .vscode/
 .idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Results (大文件)
-results/
-
-# hnswlib clone
-hnswlib/
-
-# Temp
-/tmp/
-*.tmp
-
-# 文档类 — 只本地维护，不上库
-docs/
-*.md
-!README.md
