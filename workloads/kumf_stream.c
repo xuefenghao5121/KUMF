@@ -69,9 +69,9 @@ int main(int argc, char *argv[]) {
     }
     printf("============================================================\n\n");
 
-    /* 分配数组 */
-    double *A = (double *)numa_alloc_onnode(bytes, 0);  /* 由 numactl 决定实际位置 */
-    double *B = (double *)numa_alloc_onnode(bytes, 0);
+    /* 分配数组 — 用 malloc 让 numactl --membind 完全控制分配位置 */
+    double *A = (double *)malloc(bytes);
+    double *B = (double *)malloc(bytes);
     if (!A || !B) {
         fprintf(stderr, "分配失败 (%zu MB)\n", size_mb);
         return 1;
@@ -188,12 +188,49 @@ int main(int argc, char *argv[]) {
                sec * 1000, bw);
     }
 
+    /* ====== Test 6: 指针追逐 (Pointer Chase) — 纯延迟测试 ====== */
+    {
+        /* 构建链表式指针追逐，每次访问依赖上一次结果 */
+        size_t *next = (size_t *)malloc(n_doubles * sizeof(size_t));
+        /* 随机排列 */
+        for (size_t i = 0; i < n_doubles; i++) next[i] = i;
+        unsigned int seed = 123;
+        for (size_t i = n_doubles - 1; i > 0; i--) {
+            size_t j = rand_r(&seed) % (i + 1);
+            size_t tmp = next[i]; next[i] = next[j]; next[j] = tmp;
+        }
+        /* next[i] 现在是随机排列；构建 chase 链 */
+        size_t *chase = (size_t *)malloc(n_doubles * sizeof(size_t));
+        for (size_t i = 0; i < n_doubles; i++) {
+            chase[next[i]] = next[(i + 1) % n_doubles];
+        }
+        free(next);
+
+        size_t n_chases = n_doubles;
+        double best_time = 1e18;
+        volatile size_t idx = 0;
+        for (int run = 0; run < num_runs; run++) {
+            idx = 0;
+            double t0 = get_time_ns();
+            for (size_t i = 0; i < n_chases; i++) {
+                idx = chase[idx];
+            }
+            double t1 = get_time_ns();
+            if ((t1 - t0) < best_time) best_time = t1 - t0;
+        }
+        double sec = best_time / NS_PER_SEC;
+        double latency_ns = (sec * NS_PER_SEC) / n_chases;
+        printf("[6] 指针追逐:    %8.2f ms | 平均延迟: %6.1f ns | final=%zu\n",
+               sec * 1000, latency_ns, idx);
+        free(chase);
+    }
+
     printf("\n============================================================\n");
     printf("  对比方法: 在不同 NUMA 绑定下运行，对比延迟/带宽差异\n");
     printf("  期望: 同socket(快) vs 跨socket(慢) 差异 20-40%%\n");
     printf("============================================================\n");
 
-    numa_free(A, bytes);
-    numa_free(B, bytes);
+    free(A);
+    free(B);
     return 0;
 }
