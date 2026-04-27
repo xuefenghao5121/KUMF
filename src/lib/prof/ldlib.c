@@ -18,6 +18,12 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <numa.h>
+#include <dlfcn.h>
+
+/* ---- State ---- */
+static int prof_initialized = 0;
+static pthread_mutex_t prof_cleanup_lock = PTHREAD_MUTEX_INITIALIZER;
+static int prof_cleanup_done = 0;
 
 #define ARR_SIZE 1000000              /* Max number of malloc per core (ARM: reduced from 950M, 1M×96B≈96MB/thread) */
 #define MAX_TID 512                /* Max number of tids to profile */
@@ -372,11 +378,12 @@ extern "C" int munmap(void *start, size_t length)
 
 int __thread bye_done = 0;
 
-void __attribute__((destructor)) bye(void)
+static void prof_cleanup(void)
 {
-    if (bye_done)
-        return;
-    bye_done = 1;
+    pthread_mutex_lock(&prof_cleanup_lock);
+    if (prof_cleanup_done) { pthread_mutex_unlock(&prof_cleanup_lock); return; }
+    prof_cleanup_done = 1;
+    pthread_mutex_unlock(&prof_cleanup_lock);
 
     /* Init debug flag */
     if (kumf_prof_debug < 0)
@@ -450,6 +457,9 @@ void __attribute__((destructor)) bye(void)
 
 void __attribute__((constructor)) m_init(void)
 {
+    if (prof_initialized) return;
+    prof_initialized = 1;
+
     libc_malloc = (void * ( *)(size_t))dlsym(RTLD_NEXT, "malloc");
     libc_realloc = (void * ( *)(void *, size_t))dlsym(RTLD_NEXT, "realloc");
     libc_calloc = (void * ( *)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
@@ -459,4 +469,7 @@ void __attribute__((constructor)) m_init(void)
     libc_mmap64 = (void * ( *)(void *, size_t, int, int, int, off_t))dlsym(RTLD_NEXT, "mmap64");
     libc_memalign = (void * ( *)(size_t, size_t))dlsym(RTLD_NEXT, "memalign");
     libc_posix_memalign = (int ( *)(void **, size_t, size_t))dlsym(RTLD_NEXT, "posix_memalign");
+
+    /* Register cleanup via atexit (safer than destructor during glibc unwind) */
+    atexit(prof_cleanup);
 }
