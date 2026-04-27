@@ -3,6 +3,7 @@
 #endif
 #define __USE_GNU
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdint.h>
 #include <pthread.h>
 #include <assert.h>
@@ -91,6 +92,11 @@ FILE *open_file(int tid)
     sprintf(buff, "/tmp/kumf/data.raw.%d", tid);
 
     FILE *dump = fopen(buff, "a+");
+    if (!dump) {
+        // Auto-create /tmp/kumf/ if missing
+        mkdir("/tmp/kumf", 0755);
+        dump = fopen(buff, "a+");
+    }
     if (!dump) {
         fprintf(stderr, "open %s failed\n", buff);
         exit(-1);
