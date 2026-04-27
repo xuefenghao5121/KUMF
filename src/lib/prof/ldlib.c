@@ -392,34 +392,43 @@ void __attribute__((destructor)) bye(void)
             struct log *l = &log_arr[i][j];
             #if RESOLVE_SYMBS
             _in_trace = 1;
-            char **strings = backtrace_symbols (l->callchain_strings, l->callchain_size);
+            char **strings = (l->callchain_size > 0) ? backtrace_symbols(l->callchain_strings, l->callchain_size) : NULL;
             /* Output: caller_addr (via __builtin_return_address) + backtrace[5] */
-            Dl_info info;
             char caller_sym[128] = {0};
-            if (dladdr(l->caller_addr, &info) && info.dli_sname) {
-                snprintf(caller_sym, sizeof(caller_sym), "%s+%p", info.dli_sname,
-                         (void*)((char*)l->caller_addr - (char*)info.dli_saddr));
+            if (l->caller_addr && l->caller_addr != (void*)-1L) {
+                Dl_info info;
+                if (dladdr(l->caller_addr, &info) && info.dli_sname) {
+                    snprintf(caller_sym, sizeof(caller_sym), "%s+0x%lx", info.dli_sname,
+                             (unsigned long)((char*)l->caller_addr - (char*)info.dli_saddr));
+                } else {
+                    snprintf(caller_sym, sizeof(caller_sym), "[%p]", l->caller_addr);
+                }
             } else {
-                snprintf(caller_sym, sizeof(caller_sym), "[%p]", l->caller_addr);
+                snprintf(caller_sym, sizeof(caller_sym), "[init]");
             }
             const char *bt_sym = "??";
-            if (l->callchain_size >= 6) {
-                bt_sym = strings[5];
-            } else if (l->callchain_size >= 4) {
-                bt_sym = strings[3];
+            if (strings) {
+                if (l->callchain_size >= 6)
+                    bt_sym = strings[5];
+                else if (l->callchain_size >= 4)
+                    bt_sym = strings[3];
             }
             fprintf(dump, "%s %s ", caller_sym, bt_sym);
             backtrace_ok = 1;
 
-            libc_free(strings);
+            if (strings) libc_free(strings);
             #else
-            Dl_info info;
             char caller_sym[128] = {0};
-            if (dladdr(l->caller_addr, &info) && info.dli_sname) {
-                snprintf(caller_sym, sizeof(caller_sym), "%s+%p", info.dli_sname,
-                         (void*)((char*)l->caller_addr - (char*)info.dli_saddr));
+            if (l->caller_addr && l->caller_addr != (void*)-1L) {
+                Dl_info info;
+                if (dladdr(l->caller_addr, &info) && info.dli_sname) {
+                    snprintf(caller_sym, sizeof(caller_sym), "%s+0x%lx", info.dli_sname,
+                             (unsigned long)((char*)l->caller_addr - (char*)info.dli_saddr));
+                } else {
+                    snprintf(caller_sym, sizeof(caller_sym), "[%p]", l->caller_addr);
+                }
             } else {
-                snprintf(caller_sym, sizeof(caller_sym), "[%p]", l->caller_addr);
+                snprintf(caller_sym, sizeof(caller_sym), "[init]");
             }
             fprintf(dump, "%s ", caller_sym);
             #endif
