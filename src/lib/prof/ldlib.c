@@ -52,6 +52,14 @@ static int __thread tid;
 static int __thread tid_index;
 static int tids[MAX_TID];
 
+/*
+ * Thread-local flag: when we are inside our own malloc/free/realloc interceptors,
+ * glibc may internally call mmap/munmap (for allocations > MMAP_THRESHOLD ~128KB).
+ * We should NOT record these mmap/munmap calls — they are already accounted for
+ * by the malloc/free interceptor that recorded the correct caller_addr.
+ */
+static __thread int _in_our_alloc = 0;
+
 struct log {
     uint64_t rdt;
     void *addr;
@@ -194,7 +202,9 @@ extern "C" void *malloc(size_t sz)
         m_init();
     void *addr;
     struct log *log_arr;
+    _in_our_alloc = 1;
     addr = libc_malloc(sz);
+    _in_our_alloc = 0;
     if (!_in_trace) {
         log_arr = get_log();
         if (log_arr) {
@@ -216,7 +226,9 @@ extern "C" void *calloc(size_t nmemb, size_t size)
         memset(empty_data, 0, sizeof(empty_data));
         addr = empty_data;
     } else {
+        _in_our_alloc = 1;
         addr = libc_calloc(nmemb, size);
+        _in_our_alloc = 0;
     }
     if (!_in_trace && libc_calloc) {
         struct log *log_arr = get_log();
@@ -234,7 +246,9 @@ extern "C" void *calloc(size_t nmemb, size_t size)
 
 extern "C" void *realloc(void *ptr, size_t size)
 {
+    _in_our_alloc = 1;
     void *addr = libc_realloc(ptr, size);
+    _in_our_alloc = 0;
     if (!_in_trace) {
         struct log *log_arr = get_log();
         if (log_arr) {
@@ -251,7 +265,9 @@ extern "C" void *realloc(void *ptr, size_t size)
 
 extern "C" void *memalign(size_t align, size_t sz)
 {
+    _in_our_alloc = 1;
     void *addr = libc_memalign(align, sz);
+    _in_our_alloc = 0;
     if (!_in_trace) {
         struct log *log_arr = get_log();
         if (log_arr) {
@@ -268,7 +284,9 @@ extern "C" void *memalign(size_t align, size_t sz)
 
 extern "C" int posix_memalign(void **ptr, size_t align, size_t sz)
 {
+    _in_our_alloc = 1;
     int ret = libc_posix_memalign(ptr, align, sz);
+    _in_our_alloc = 0;
     if (!_in_trace) {
         struct log *log_arr = get_log();
         if (log_arr) {
@@ -286,6 +304,9 @@ extern "C" int posix_memalign(void **ptr, size_t align, size_t sz)
 extern "C" void free(void *p)
 {
     struct log *log_arr;
+    _in_our_alloc = 1;
+    libc_free(p);
+    _in_our_alloc = 0;
     if (!_in_trace && libc_free) {
         log_arr = get_log();
         if (log_arr) {
@@ -296,7 +317,6 @@ extern "C" void free(void *p)
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
         }
     }
-    libc_free(p);
 }
 
 void *operator new(size_t sz) noexcept(false)
@@ -329,11 +349,19 @@ void operator delete[](void *ptr)
     free(ptr);
 }
 
+/*
+ * mmap/mmap64/munmap interceptors:
+ * Only record calls that come from OUTSIDE our alloc interceptors.
+ * When glibc's malloc/free internally calls mmap (for >128KB allocations),
+ * _in_our_alloc is set, so we skip — the malloc/free interceptor already
+ * recorded the allocation with the correct caller_addr (main, kumf_tiered, etc.).
+ * We only record direct mmap calls from the application (e.g., mmap-based allocators).
+ */
 extern "C" void *mmap(void *start, size_t length, int prot, int flags, int fd, off_t offset)
 {
     void *addr = libc_mmap(start, length, prot, flags, fd, offset);
 
-    if (!_in_trace) {
+    if (!_in_trace && !_in_our_alloc) {
         struct log *log_arr = get_log();
         if (log_arr) {
             rdtscll(log_arr->rdt);
@@ -351,7 +379,7 @@ extern "C" void *mmap64(void *start, size_t length, int prot, int flags, int fd,
 {
     void *addr = libc_mmap64(start, length, prot, flags, fd, offset);
 
-    if (!_in_trace) {
+    if (!_in_trace && !_in_our_alloc) {
         struct log *log_arr = get_log();
         if (log_arr) {
             rdtscll(log_arr->rdt);
@@ -368,7 +396,7 @@ extern "C" void *mmap64(void *start, size_t length, int prot, int flags, int fd,
 extern "C" int munmap(void *start, size_t length)
 {
     int ret = libc_munmap(start, length);
-    if (!_in_trace && libc_free) {
+    if (!_in_trace && !_in_our_alloc && libc_free) {
         struct log *l = get_log();
         if (l) {
             rdtscll(l->rdt);
