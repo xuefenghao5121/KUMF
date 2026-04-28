@@ -340,6 +340,7 @@ extern "C" void *mmap(void *start, size_t length, int prot, int flags, int fd, o
             log_arr->addr = addr;
             log_arr->size = length;
             log_arr->entry_type = flags + 100;
+            log_arr->caller_addr = __builtin_return_address(0);
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
         }
     }
@@ -357,6 +358,7 @@ extern "C" void *mmap64(void *start, size_t length, int prot, int flags, int fd,
             log_arr->addr = addr;
             log_arr->size = length;
             log_arr->entry_type = flags + 200;
+            log_arr->caller_addr = __builtin_return_address(0);
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
         }
     }
@@ -373,6 +375,7 @@ extern "C" int munmap(void *start, size_t length)
             l->addr = start;
             l->size = length;
             l->entry_type = 90;
+            l->caller_addr = __builtin_return_address(0);
             get_trace(&l->callchain_size, l->callchain_strings);
         }
     }
