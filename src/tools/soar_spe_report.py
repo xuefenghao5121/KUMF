@@ -55,12 +55,25 @@ def detect_numa_topology():
                     if nodes:
                         continue
                 
-                # Parse "node X distance: Y Y Y Y ..."
+                # Parse "node X distances: Y Y Y Y ..." (some systems: "node X distance: Y Y Y Y")
                 if line.startswith('node ') and 'distance' in line:
                     parts = line.split()
-                    src = int(parts[1])
-                    vals = list(map(int, parts[3:]))
-                    distances[src] = vals
+                    # Skip header lines like "node distances:" where parts[1] is not a number
+                    try:
+                        src = int(parts[1])
+                    except ValueError:
+                        continue
+                    # Find the colon token and take everything after it
+                    vals = []
+                    for p in parts[2:]:
+                        if p.endswith(':'):
+                            continue
+                        try:
+                            vals.append(int(p))
+                        except ValueError:
+                            break
+                    if vals:
+                        distances[src] = vals
             
             if nodes and distances:
                 # Find local distance for first node
