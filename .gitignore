@@ -5,6 +5,9 @@
 *.pyc
 __pycache__/
 
+# 构建目录
+build/
+
 # SPE/perf 数据
 perf.data
 perf_filtered.perf
@@ -14,5 +17,9 @@ perf_filtered.perf
 .vscode/
 .idea/
 
-# 构建目录
-build/
+# 中间文档（仅本地留存，不上库）
+MEMORY.md
+GAP_ANALYSIS.md
+DESIGN.md
+ROADMAP.md
+docs/reviews/
