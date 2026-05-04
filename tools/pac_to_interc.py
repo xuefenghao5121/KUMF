@@ -103,29 +103,55 @@ def load_prof_log(prof_path):
     """
     加载 prof 的输出日志
     
-    prof 输出格式（从 ldlib.c 分析）:
-    每行: timestamp addr size entry_type callchain_size caller_addr [callchain...]
+    prof 实际输出格式（从 ldlib.c 确认）:
+    每行: caller_symbol timestamp size addr entry_type
+    
+    caller_symbol 格式:
+      - "func_name+0xNN"  (dladdr 解析成功)
+      - "[0xADDR]"        (dladdr 解析失败，原始地址)
+      - "[init]"          (初始化阶段)
+    
+    entry_type: 0=free, 1=malloc, >=100=mmap
+    
+    示例行:
+      main+0x34 12345678 209715200 400003ab9000 1
+      [0x400003ab9ad0] 12345680 52428800 40000fc60000 100
     """
     allocations = []
     with open(prof_path, 'r') as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith('#') or line.startswith('['):
-                continue
+                # 注意: [0xADDR] 和 [init] 是合法的 caller，不要跳过
+                pass
+            
             parts = line.split()
             if len(parts) < 5:
                 continue
             try:
-                timestamp = int(parts[0])
-                addr = int(parts[1], 16) if parts[1].startswith('0x') else int(parts[1])
+                caller_sym = parts[0]
+                timestamp = int(parts[1])
                 size = int(parts[2])
-                entry_type = int(parts[3])
-                caller_addr = int(parts[4], 16) if parts[4].startswith('0x') else int(parts[4])
+                addr = int(parts[3], 16) if parts[3].startswith('0x') or parts[3].startswith('0X') else int(parts[3])
+                entry_type = int(parts[4])
+                
+                # 提取 caller_addr：从 [0xADDR] 格式解析
+                caller_addr = 0
+                if caller_sym.startswith('[0x') and caller_sym.endswith(']'):
+                    caller_addr = int(caller_sym[1:-1], 16)
+                elif caller_sym.startswith('[init]'):
+                    caller_addr = 0
+                else:
+                    # func_name+0xNN 格式，无法直接恢复地址，用符号名做 key
+                    caller_addr = 0
+                
                 allocations.append({
-                    'addr': addr,
-                    'size': size,
-                    'entry_type': entry_type,  # 0=free, 1=malloc, >=100=mmap
+                    'caller_sym': caller_sym,
                     'caller_addr': caller_addr,
+                    'timestamp': timestamp,
+                    'size': size,
+                    'addr': addr,
+                    'entry_type': entry_type,  # 0=free, 1=malloc, >=100=mmap
                 })
             except (ValueError, IndexError):
                 continue
@@ -180,7 +206,9 @@ def cross_correlate(pages, allocations):
         avg_pac = total_pac / total_pages if total_pages > 0 else 0
         hot_ratio = hot_pages / total_pages if total_pages > 0 else 0
         
+        # 用 caller_sym 作为 key（比 caller_addr 更稳定）
         alloc_pac.append({
+            'caller_sym': alloc['caller_sym'],
             'caller_addr': alloc['caller_addr'],
             'size': alloc['size'],
             'addr': alloc['addr'],
@@ -289,10 +317,10 @@ def generate_interc_conf_size_based(ranges, output_path, fast_node=0, slow_node=
 def generate_interc_conf_alloc_based(alloc_pac, output_path, fast_node=0, slow_node=2):
     """生成基于 prof 交叉关联的 interc 配置（最精确）"""
     
-    # 按 caller_addr 聚合
+    # 按 caller_sym 聚合
     by_caller = defaultdict(lambda: {'sizes': [], 'total_pac': 0, 'count': 0, 'hot_count': 0})
     for a in alloc_pac:
-        key = a['caller_addr']
+        key = a['caller_sym']
         by_caller[key]['sizes'].append(a['size'])
         by_caller[key]['total_pac'] += a['avg_pac']
         by_caller[key]['count'] += 1
@@ -312,8 +340,15 @@ def generate_interc_conf_alloc_based(alloc_pac, output_path, fast_node=0, slow_n
             node = fast_node if tier in ('HOT', 'WARM') else slow_node
             typical_size = max(info['sizes'])
             
-            f.write(f"# caller=0x{caller:x} avg_PAC={avg_pac:.0f} tier={tier} ({info['count']} allocs, hot_ratio={hot_ratio:.1%})\n")
-            f.write(f"0x{caller:x}-0x{caller:x} = {node}  # size~{typical_size/1024/1024:.0f}MB {tier}\n")
+            f.write(f"# caller={caller} avg_PAC={avg_pac:.0f} tier={tier} ({info['count']} allocs, hot_ratio={hot_ratio:.1%})\n")
+            
+            # 如果有 caller_addr，用 addr_rule
+            if info.get('caller_addr') and info['caller_addr'] != 0:
+                ca = info['caller_addr']
+                f.write(f"0x{ca:x}-0x{ca:x} = {node}  # {caller} size~{typical_size/1024/1024:.0f}MB {tier}\n")
+            else:
+                # 用 name_rule
+                f.write(f"{caller} = {node}  # size~{typical_size/1024/1024:.0f}MB {tier}\n")
 
 
 def main():

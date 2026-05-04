@@ -69,7 +69,7 @@ make clean
 # 1. 采集 SPE + prof（同时运行，地址对得上）
 perf record -e arm_spe/load_filter=1,store_filter=1,min_latency=32/ \
   -o /tmp/kumf/spe.perf \
-  -- env LD_PRELOAD=build/libkumf_prof.so KUMF_PROF_OUT=/tmp/kumf/prof.log \
+  -- env LD_PRELOAD=build/libkumf_prof.so \
   ./build/kumf_tiered 200 100 50
 
 # 2. 解析 SPE → page PAC 评分
@@ -78,7 +78,7 @@ perf report -D -i /tmp/kumf/spe.perf | python3 tools/spe_page_pac.py -o /tmp/kum
 # 3. PAC + prof 交叉关联 → interc 配置
 python3 tools/pac_to_interc.py \
   --pac-csv /tmp/kumf/page_pac.csv \
-  --prof-log /tmp/kumf/prof.log \
+  --prof-log /tmp/kumf/data.raw.1 \
   --mode alloc -o /tmp/kumf/kumf_pac.conf
 
 # 4. 用 PAC 配置运行
