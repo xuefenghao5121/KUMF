@@ -26,7 +26,7 @@
 #include <numa.h>
 
 /* ---- Configuration ---- */
-#define MAX_ADDR_RULES 256
+#define MAX_ADDR_RULES 8192
 #define MAX_NAME_RULES 256
 #define MAX_FUNC_NAME 256
 #define ADDR_HASH_BITS 16
