@@ -225,6 +225,12 @@ def _sample_is_valid(sample):
 
 def _flush_sample(sample, page_stats):
     """将一条样本聚合到 page 级别"""
+    # 过滤内核地址（0xffff... 是内核空间，不参与用户态分级）
+    if 'va' in sample:
+        va_str = sample['va']
+        if va_str.startswith('0xffff') or va_str.startswith('0xFFFF'):
+            return  # 跳过内核地址
+    
     try:
         va = int(sample['va'], 16)
     except (ValueError, KeyError):
@@ -284,9 +290,11 @@ def compute_pac_scores(page_stats, mlp_estimate=1.0):
         
         avg_lat_tot = stats['lat_tot_sum'] / stats['access_count'] if stats['lat_tot_sum'] > 0 else 0
         
-        # SVE 感知 MLP 调整：SVE 向量 load 天然高 MLP，降低 PAC
+        # SVE 感知 MLP 调整：SVE 向量 load 天然高 MLP
+        # 但如果几乎全是 SVE（如 kumf_tiered），不应该过度调整
+        # 保守策略：sve_ratio=100% → MLP 2x（而非 4x），避免阈值偏移
         sve_ratio = stats['sve_count'] / stats['access_count'] if stats['access_count'] > 0 else 0
-        effective_mlp = mlp_estimate * (1 + sve_ratio * 3)  # SVE load MLP 约 3-4x 标量
+        effective_mlp = mlp_estimate * (1 + sve_ratio * 1.0)
         
         # PAC = access_count × avg_latency / effective_MLP
         pac = stats['access_count'] * avg_lat_tot / effective_mlp
@@ -326,14 +334,17 @@ def detect_knee(pac_scores):
     # 方法：按累计访问量找到 80/20 分界线
     total_access = sum(p['access_count'] for p in sorted_pages)
     
+    # 找 HOT/WARM 分界线（累计 80% 访问量）
     cumulative = 0
-    hot_idx = len(pac_values)  # 默认全热
+    hot_idx = len(pac_values)
     for i, p in enumerate(sorted_pages):
         cumulative += p['access_count']
         if cumulative >= total_access * 0.8:
             hot_idx = i + 1
             break
     
+    # 找 WARM/COLD 分界线（累计 95% 访问量）—— 重新从 0 计数
+    cumulative = 0
     warm_idx = len(pac_values)
     for i, p in enumerate(sorted_pages):
         cumulative += p['access_count']
