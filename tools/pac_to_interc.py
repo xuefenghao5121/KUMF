@@ -121,9 +121,8 @@ def load_prof_log(prof_path):
     with open(prof_path, 'r') as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith('#') or line.startswith('['):
-                # 注意: [0xADDR] 和 [init] 是合法的 caller，不要跳过
-                pass
+            if not line or line.startswith('#'):
+                continue
             
             parts = line.split()
             if len(parts) < 5:
@@ -132,7 +131,11 @@ def load_prof_log(prof_path):
                 caller_sym = parts[0]
                 timestamp = int(parts[1])
                 size = int(parts[2])
-                addr = int(parts[3], 16) if parts[3].startswith('0x') or parts[3].startswith('0X') else int(parts[3])
+                # addr: 十六进制，可能不带 0x 前缀 (如 bc102a0)
+                try:
+                    addr = int(parts[3], 16)
+                except ValueError:
+                    addr = int(parts[3])
                 entry_type = int(parts[4])
                 
                 # 提取 caller_addr：从 [0xADDR] 格式解析
