@@ -63,7 +63,47 @@ make clean
 
 ## 使用
 
-### 端到端流程
+### 安装 CLI
+
+```bash
+make install   # 安装 kumf 到 ~/.local/bin
+```
+
+### 一键诊断
+
+```bash
+# 一条命令完成：采样→分析→报告+配置
+kumf diagnose -- ./build/kumf_tiered 200 100 50
+
+# 自定义参数
+kumf diagnose --min-lat 64 -o /tmp/my_test -- ./build/kumf_tiered 200 100 50
+```
+
+### 用配置运行
+
+```bash
+# 用 diagnose 生成的配置运行
+kumf run --conf /tmp/kumf/kumf.conf -- ./build/kumf_tiered 200 100 50
+
+# 开启调试输出
+kumf run --conf /tmp/kumf/kumf.conf --debug -- ./build/kumf_tiered 200 100 50
+```
+
+### 性能对比
+
+```bash
+# 自动跑四组对比：全快/全慢/first-touch/分层
+kumf bench --conf /tmp/kumf/kumf.conf -- ./build/kumf_tiered 200 100 50
+```
+
+### 只分析（不采样）
+
+```bash
+# 对已有的 perf.data 做分析
+kumf analyze --perf-data perf_filtered.perf -o /tmp/kumf
+```
+
+### 手动分步流程（高级）
 
 ```bash
 # 1. 采集 SPE + prof（同时运行，地址对得上）

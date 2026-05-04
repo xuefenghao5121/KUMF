@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""
+kumf - Kunpeng Unified Memory Framework CLI
+
+形态1: 一键诊断 → 报告 + 配置
+形态2: 透明加速 → 自动采样+运行
+形态3: 常驻守护 (后续)
+
+用法:
+  kumf diagnose [--steps N] [--min-lat N] [-o DIR] -- ./workload [args...]
+  kumf run [--conf FILE] -- ./workload [args...]
+  kumf analyze [--perf-data FILE] [-o DIR]
+"""
+
+import sys
+import os
+import subprocess
+import argparse
+import shutil
+import time
+import json
+from datetime import datetime
+from pathlib import Path
+
+# KUMF 根目录（脚本所在目录的上层）
+KUMF_ROOT = Path(__file__).resolve().parent.parent
+TOOLS_DIR = Path(__file__).resolve().parent
+BUILD_DIR = KUMF_ROOT / "build"
+
+# 工具路径
+SPE_PAGE_PAC = TOOLS_DIR / "spe_page_pac.py"
+PAC_TO_INTERC = TOOLS_DIR / "pac_to_interc.py"
+INTERC_SO = BUILD_DIR / "libkumf_interc.so"
+PROF_SO = BUILD_DIR / "libkumf_prof.so"
+
+
+def check_environment():
+    """检查运行环境"""
+    issues = []
+    
+    # 检查 perf
+    if not shutil.which("perf"):
+        issues.append("perf not found (need linux-perf)")
+    
+    # 检查 Python3
+    if not shutil.which("python3"):
+        issues.append("python3 not found")
+    
+    # 检查 numactl
+    if not shutil.which("numactl"):
+        issues.append("numactl not found (need numactl-devel)")
+    
+    # 检查编译产物
+    if not INTERC_SO.exists():
+        issues.append(f"{INTERC_SO} not found (run: make libs)")
+    
+    if not PROF_SO.exists():
+        issues.append(f"{PROF_SO} not found (run: make libs)")
+    
+    # 检查 SPE 可用
+    try:
+        result = subprocess.run(["perf", "list"], capture_output=True, text=True, timeout=5)
+        if "arm_spe" not in result.stdout:
+            issues.append("ARM SPE not available (need ARM platform with SPE support)")
+    except Exception:
+        pass
+    
+    return issues
+
+
+def check_perf_paranoid():
+    """检查 perf_event_paranoid 设置"""
+    try:
+        with open("/proc/sys/kernel/perf_event_paranoid", "r") as f:
+            val = int(f.read().strip())
+            return val
+    except:
+        return 999
+
+
+def get_numa_topology():
+    """获取 NUMA 拓扑信息"""
+    topology = {"nodes": [], "distances": {}}
+    try:
+        result = subprocess.run(
+            ["numactl", "-H"], capture_output=True, text=True, timeout=10
+        )
+        lines = result.stdout.strip().split("\n")
+        for line in lines:
+            if line.startswith("node ") and "size" in line:
+                parts = line.split()
+                node_id = int(parts[1])
+                mem_mb = int(parts[3])
+                topology["nodes"].append({"id": node_id, "mem_mb": mem_mb})
+    except Exception:
+        pass
+    return topology
+
+
+# ============================================================
+# kumf diagnose
+# ============================================================
+
+def cmd_diagnose(args):
+    """一键诊断：自动采样 → 分析 → 报告 + 配置"""
+    
+    print("╔══════════════════════════════════════════════════╗")
+    print("║       KUMF Tiered Memory Diagnosis               ║")
+    print("║       Kunpeng Unified Memory Framework            ║")
+    print("╚══════════════════════════════════════════════════╝")
+    print()
+    
+    # 1. 环境检查
+    print("── Step 0/4: Environment Check ──────────────────────")
+    issues = check_environment()
+    if issues:
+        print("❌ Environment issues:")
+        for issue in issues:
+            print(f"   - {issue}")
+        return 1
+    
+    paranoid = check_perf_paranoid()
+    if paranoid > 1:
+        print(f"⚠️  perf_event_paranoid={paranoid} (need ≤1 for SPE)")
+        print(f"   Fix: sudo sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid'")
+        print(f"   Or:  run as root")
+        return 1
+    print(f"✅ perf_event_paranoid={paranoid}")
+    print(f"✅ All tools available")
+    print()
+    
+    # NUMA 拓扑
+    topo = get_numa_topology()
+    if topo["nodes"]:
+        print(f"   NUMA topology: {len(topo['nodes'])} nodes")
+        for n in topo["nodes"]:
+            print(f"   Node {n['id']}: {n['mem_mb']} MB")
+    print()
+    
+    # 准备输出目录
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    workload = args.workload
+    workload_args = args.workload_args
+    
+    spe_data = output_dir / "spe.perf"
+    spe_contention_data = output_dir / "spe_contention.perf"
+    prof_dir = output_dir / "prof"
+    prof_dir.mkdir(exist_ok=True)
+    
+    # 2. SPE + prof 采样
+    print("── Step 1/4: SPE Sampling + Prof Tracking ──────────")
+    print(f"   Workload: {' '.join([workload] + workload_args)}")
+    print(f"   SPE filter: min_latency={args.min_lat}")
+    print(f"   Output: {output_dir}")
+    print()
+    
+    # 构建 perf record 命令
+    spe_event = f"arm_spe/load_filter=1,store_filter=1,min_latency={args.min_lat}/"
+    
+    # 使用 /tmp 作为 prof 输出目录
+    prof_tmp = f"/tmp/kumf_prof_{os.getpid()}"
+    os.makedirs(prof_tmp, exist_ok=True)
+    
+    # 设置 LD_PRELOAD: prof.so 记录分配
+    env = os.environ.copy()
+    env["LD_PRELOAD"] = str(PROF_SO)
+    
+    # perf record + workload
+    perf_cmd = [
+        "perf", "record",
+        "-e", spe_event,
+        "-o", str(spe_data),
+        "--",
+    ] + [workload] + workload_args
+    
+    print(f"   Running: {' '.join(perf_cmd[:6])}...")
+    t0 = time.time()
+    try:
+        result = subprocess.run(perf_cmd, env=env, timeout=600)
+        elapsed = time.time() - t0
+        if result.returncode != 0:
+            print(f"⚠️  Workload exited with code {result.returncode}")
+        print(f"✅ Sampling done ({elapsed:.1f}s)")
+    except subprocess.TimeoutExpired:
+        print("❌ Workload timed out (600s)")
+        return 1
+    except KeyboardInterrupt:
+        print("\n⚠️  Interrupted")
+        return 1
+    print()
+    
+    # 检查 perf.data
+    if not spe_data.exists():
+        print("❌ No SPE data captured")
+        return 1
+    spe_size_mb = spe_data.stat().st_size / 1024 / 1024
+    print(f"   SPE data: {spe_size_mb:.1f} MB")
+    
+    # 查找 prof 输出
+    prof_files = list(Path("/tmp/kumf").glob("data.raw.*"))
+    if not prof_files:
+        prof_files = list(Path(prof_tmp).glob("data.raw.*"))
+    
+    # 3. 解析 SPE → page PAC
+    print()
+    print("── Step 2/4: SPE LAT → Page PAC Scoring ────────────")
+    
+    pac_csv = output_dir / "page_pac.csv"
+    
+    # perf report -D | spe_page_pac.py
+    perf_report_cmd = ["perf", "report", "-D", "-i", str(spe_data)]
+    pac_cmd = [sys.executable, str(SPE_PAGE_PAC), "-o", str(output_dir)]
+    
+    print(f"   Parsing SPE records (this may take a few minutes)...")
+    t0 = time.time()
+    try:
+        # pipe: perf report -D → spe_page_pac.py
+        proc_report = subprocess.Popen(
+            perf_report_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        proc_pac = subprocess.Popen(
+            pac_cmd, stdin=proc_report.stdout, stdout=sys.stdout, stderr=sys.stderr
+        )
+        proc_report.stdout.close()
+        proc_pac.wait()
+        elapsed = time.time() - t0
+        print(f"✅ PAC analysis done ({elapsed:.1f}s)")
+    except Exception as e:
+        print(f"❌ PAC analysis failed: {e}")
+        return 1
+    print()
+    
+    # 4. PAC + prof 交叉关联 → interc 配置
+    print("── Step 3/4: PAC + Prof → interc Config ────────────")
+    
+    conf_path = output_dir / "kumf.conf"
+    
+    if prof_files and pac_csv.exists():
+        # 用 prof 交叉关联（最精确）
+        prof_file = prof_files[0]  # 取第一个（主线程）
+        print(f"   Prof data: {prof_file}")
+        print(f"   PAC CSV: {pac_csv}")
+        
+        interc_cmd = [
+            sys.executable, str(PAC_TO_INTERC),
+            "--pac-csv", str(pac_csv),
+            "--prof-log", str(prof_file),
+            "--mode", "alloc",
+            "-o", str(conf_path),
+        ]
+        try:
+            result = subprocess.run(interc_cmd, capture_output=True, text=True)
+            print(result.stdout, end="")
+            if result.returncode != 0:
+                print(f"⚠️  Alloc-based config failed, falling back to size-based")
+                # fallback to size-based
+                interc_cmd = [
+                    sys.executable, str(PAC_TO_INTERC),
+                    "--pac-csv", str(pac_csv),
+                    "--mode", "size",
+                    "-o", str(conf_path),
+                ]
+                result = subprocess.run(interc_cmd, capture_output=True, text=True)
+                print(result.stdout, end="")
+        except Exception as e:
+            print(f"⚠️  Cross-correlation failed: {e}")
+    elif pac_csv.exists():
+        # 没有 prof，用 size-based
+        print(f"   No prof data, using size-based mode")
+        interc_cmd = [
+            sys.executable, str(PAC_TO_INTERC),
+            "--pac-csv", str(pac_csv),
+            "--mode", "size",
+            "-o", str(conf_path),
+        ]
+        result = subprocess.run(interc_cmd, capture_output=True, text=True)
+        print(result.stdout, end="")
+    else:
+        print("❌ No PAC data available")
+        return 1
+    
+    print(f"✅ Config generated: {conf_path}")
+    print()
+    
+    # 5. 输出报告
+    print("── Step 4/4: Diagnosis Report ──────────────────────")
+    
+    report_path = output_dir / "pac_summary.txt"
+    json_path = output_dir / "kumf_report.json"
+    
+    if report_path.exists():
+        # 读取报告中的关键信息
+        with open(report_path, 'r') as f:
+            content = f.read()
+        # 提取关键行
+        for line in content.split("\n"):
+            if any(kw in line for kw in ["Records parsed", "Unique pages", "Total memory", "HOT ", "WARM ", "COLD ", "local DRAM", "remote DRAM"]):
+                print(f"   {line.strip()}")
+    
+    print()
+    print("=" * 54)
+    print(f"  📄 Report:  {report_path}")
+    print(f"  📊 CSV:     {pac_csv}")
+    print(f"  📋 JSON:    {json_path}")
+    print(f"  ⚙️  Config:  {conf_path}")
+    print()
+    print(f"  Run with:  kumf run --conf {conf_path} -- {' '.join([workload] + workload_args)}")
+    print("=" * 54)
+    
+    # 清理 prof 临时文件
+    try:
+        import shutil
+        if os.path.exists(prof_tmp):
+            shutil.rmtree(prof_tmp, ignore_errors=True)
+    except:
+        pass
+    
+    return 0
+
+
+# ============================================================
+# kumf run
+# ============================================================
+
+def cmd_run(args):
+    """用 interc 配置运行 workload"""
+    
+    conf = args.conf
+    workload = args.workload
+    workload_args = args.workload_args
+    
+    if not conf or not os.path.exists(conf):
+        print(f"❌ Config not found: {conf}")
+        print(f"   Run 'kumf diagnose' first to generate config")
+        return 1
+    
+    if not INTERC_SO.exists():
+        print(f"❌ {INTERC_SO} not found (run: make libs)")
+        return 1
+    
+    env = os.environ.copy()
+    env["KUMF_CONF"] = os.path.abspath(conf)
+    env["LD_PRELOAD"] = str(INTERC_SO)
+    
+    if args.debug:
+        env["KUMF_DEBUG"] = "1"
+    
+    cmd = [workload] + workload_args
+    print(f"🚀 KUMF running with tiered memory config")
+    print(f"   Config: {conf}")
+    print(f"   Interc: {INTERC_SO}")
+    print(f"   Command: {' '.join(cmd)}")
+    print()
+    
+    try:
+        result = subprocess.run(cmd, env=env)
+        return result.returncode
+    except KeyboardInterrupt:
+        print("\n⚠️  Interrupted")
+        return 1
+
+
+# ============================================================
+# kumf analyze
+# ============================================================
+
+def cmd_analyze(args):
+    """只分析已有的 perf.data，不采样"""
+    
+    perf_data = args.perf_data
+    if not perf_data or not os.path.exists(perf_data):
+        print(f"❌ perf.data not found: {perf_data}")
+        return 1
+    
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"🦐 KUMF Analyze")
+    print(f"   Input: {perf_data}")
+    print(f"   Output: {output_dir}")
+    
+    # perf report -D | spe_page_pac.py
+    perf_report_cmd = ["perf", "report", "-D", "-i", perf_data]
+    pac_cmd = [sys.executable, str(SPE_PAGE_PAC), "-o", str(output_dir)]
+    
+    print(f"   Parsing SPE records...")
+    try:
+        proc_report = subprocess.Popen(
+            perf_report_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        proc_pac = subprocess.Popen(
+            pac_cmd, stdin=proc_report.stdout, stdout=sys.stdout, stderr=sys.stderr
+        )
+        proc_report.stdout.close()
+        proc_pac.wait()
+        print(f"✅ Done. Output in {output_dir}")
+    except Exception as e:
+        print(f"❌ Analysis failed: {e}")
+        return 1
+    
+    return 0
+
+
+# ============================================================
+# kumf bench
+# ============================================================
+
+def cmd_bench(args):
+    """性能对比：全快/全慢/first-touch/分层"""
+    
+    workload = args.workload
+    workload_args = args.workload_args
+    conf = args.conf
+    
+    if not conf or not os.path.exists(conf):
+        print(f"❌ Config not found: {conf}")
+        return 1
+    
+    results = {}
+    
+    def run_test(name, cmd, env=None):
+        print(f"  {name}...", end=" ", flush=True)
+        t0 = time.time()
+        try:
+            result = subprocess.run(cmd, env=env, capture_output=True, timeout=300)
+            elapsed = time.time() - t0
+            results[name] = elapsed
+            print(f"{elapsed:.3f}s")
+        except Exception as e:
+            results[name] = None
+            print(f"FAILED ({e})")
+    
+    print()
+    print("── KUMF Performance Benchmark ────────────────────")
+    print()
+    
+    # 1. 全快层
+    run_test("全快层 (Node 0)", 
+             ["numactl", "--cpunodebind=0", "--membind=0", workload] + workload_args)
+    
+    # 2. 全慢层
+    run_test("全慢层 (Node 2)",
+             ["numactl", "--cpunodebind=0", "--membind=2", workload] + workload_args)
+    
+    # 3. First-touch
+    run_test("First-touch (默认)",
+             [workload] + workload_args)
+    
+    # 4. PAC 分层
+    env = os.environ.copy()
+    env["KUMF_CONF"] = os.path.abspath(conf)
+    env["LD_PRELOAD"] = str(INTERC_SO)
+    run_test("PAC 分层",
+             [workload] + workload_args, env=env)
+    
+    # 输出对比
+    print()
+    print("── Results ───────────────────────────────────────")
+    
+    fast = results.get("全快层 (Node 0)")
+    slow = results.get("全慢层 (Node 2)")
+    tiered = results.get("PAC 分层")
+    
+    if fast and slow and tiered:
+        gap_total = slow - fast
+        gap_closed = slow - tiered
+        gap_closing_pct = gap_closed / gap_total * 100 if gap_total > 0 else 0
+        speedup = slow / tiered if tiered > 0 else 0
+        
+        print(f"  Gap closing: {gap_closing_pct:.1f}%")
+        print(f"  Tiered vs slow: {speedup:.2f}x speedup")
+        if tiered < fast:
+            print(f"  🎉 Tiered is FASTER than all-fast! (bandwidth benefit)")
+        elif tiered > fast:
+            pct_slower = (tiered - fast) / fast * 100
+            print(f"  Tiered is {pct_slower:.1f}% slower than all-fast (expected for single-workload)")
+    
+    print()
+    
+    # JSON 输出
+    bench_path = Path(args.output) / "bench_results.json" if args.output else None
+    if bench_path:
+        bench_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(bench_path, 'w') as f:
+            json.dump({
+                "timestamp": datetime.now().isoformat(),
+                "results": {k: v for k, v in results.items() if v is not None},
+                "gap_closing_pct": gap_closing_pct if fast and slow and tiered else None,
+            }, f, indent=2)
+        print(f"  📊 Results saved: {bench_path}")
+    
+    return 0
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="kumf",
+        description="KUMF - Kunpeng Unified Memory Framework CLI"
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    
+    # diagnose
+    p_diag = subparsers.add_parser("diagnose", help="一键诊断：采样→分析→报告+配置")
+    p_diag.add_argument("--min-lat", type=int, default=32, help="SPE min_latency filter (default: 32)")
+    p_diag.add_argument("-o", "--output", default="/tmp/kumf", help="Output directory")
+    p_diag.add_argument("workload", help="Workload binary")
+    p_diag.add_argument("workload_args", nargs="*", help="Workload arguments")
+    
+    # run
+    p_run = subparsers.add_parser("run", help="用 interc 配置运行 workload")
+    p_run.add_argument("--conf", "-c", default=None, help="interc config file")
+    p_run.add_argument("--debug", action="store_true", help="Enable KUMF debug output")
+    p_run.add_argument("workload", help="Workload binary")
+    p_run.add_argument("workload_args", nargs="*", help="Workload arguments")
+    
+    # analyze
+    p_analyze = subparsers.add_parser("analyze", help="只分析已有的 perf.data")
+    p_analyze.add_argument("--perf-data", default="perf.data", help="perf.data file")
+    p_analyze.add_argument("-o", "--output", default="/tmp/kumf", help="Output directory")
+    
+    # bench
+    p_bench = subparsers.add_parser("bench", help="性能对比：全快/全慢/first-touch/分层")
+    p_bench.add_argument("--conf", "-c", required=True, help="interc config file")
+    p_bench.add_argument("-o", "--output", default="/tmp/kumf", help="Output directory for results")
+    p_bench.add_argument("workload", help="Workload binary")
+    p_bench.add_argument("workload_args", nargs="*", help="Workload arguments")
+    
+    args = parser.parse_args()
+    
+    if args.command == "diagnose":
+        return cmd_diagnose(args)
+    elif args.command == "run":
+        return cmd_run(args)
+    elif args.command == "analyze":
+        return cmd_analyze(args)
+    elif args.command == "bench":
+        return cmd_bench(args)
+    else:
+        parser.print_help()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

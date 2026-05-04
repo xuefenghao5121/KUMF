@@ -27,7 +27,7 @@ ifeq ($(ARCH),aarch64)
   CFLAGS_COMMON += -DARM64
 endif
 
-.PHONY: all libs workloads tools clean help
+.PHONY: all libs workloads tools clean help install
 
 all: libs workloads tools
 
@@ -38,6 +38,7 @@ help:
 	@echo "  make libs     - Build LD_PRELOAD libraries (interc, prof, mlock)"
 	@echo "  make workloads - Build test workloads"
 	@echo "  make tools    - Build SPE profiling tools"
+	@echo "  make install  - Install kumf CLI to ~/.local/bin"
 	@echo "  make clean    - Remove build artifacts"
 	@echo ""
 	@echo "Variables:"
@@ -110,6 +111,15 @@ $(BUILD_DIR)/spe_preload.so: src/tools/spe_preload.c src/tools/spe_self_profile.
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
+
+# Install kumf CLI
+PREFIX ?= $(HOME)/.local
+
+install: tools
+	install -d $(PREFIX)/bin
+	install -m 755 tools/kumf $(PREFIX)/bin/kumf
+	@echo "✅ Installed: $(PREFIX)/bin/kumf"
+	@echo "   Add to PATH: export PATH=$(PREFIX)/bin:\$$PATH"
 
 clean:
 	rm -rf $(BUILD_DIR)
