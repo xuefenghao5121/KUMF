@@ -1,155 +1,148 @@
-# KUMF — Kunpeng Unified Memory Framework
+# KUMF - Kunpeng Unified Memory Framework
 
-基于 OSDI'25 论文《Tiered Memory Management Beyond Hotness》的 ARM 原生 tiered memory 分配器。
-**不是移植，是重新实现 + 创新。**
+基于 OSDI'25 论文《Tiered Memory Management Beyond Hotness》的 **ARM 原生 tiered memory 分配器**。
+
+不是移植，是重新实现 + 创新。
 
 ## 核心创新
 
 1. **AOL 指标的 ARM 重建** — 首次在 ARM 上用 SPE + cache PMU 重建 Amortized Offcore Latency
 2. **SVE 感知评分** — 利用 SVE 向量 load 的天然高 MLP 特征优化对象分级
-3. **ARM SPE 精确采样** — SPE 的 `data_source`/`latency` 信息比 Intel PEBS 更丰富
-4. **多场景验证** — HPC（MD 模拟）+ 通用计算（向量数据库）
+3. **ARM SPE 精确采样** — SPE 的 data_source/latency 比 Intel PEBS 更丰富
+4. **多场景验证** — HPC（GROMACS/mini_md）+ 通用计算（hnswlib 向量数据库）
 
 ## 项目结构
 
 ```
 KUMF/
-├── README.md                    # 本文件
-├── MEMORY.md                    # 项目记忆与决策记录
-├── ROADMAP.md                   # 里程碑与 TODO
-├── DESIGN.md                    # 架构设计
-├── GAP_ANALYSIS.md              # 缺口分析与进度
+├── tools/                       # Python 分析工具
+│   ├── spe_page_pac.py          # ⭐ SPE LAT 解析 → page 级 PAC 评分
+│   ├── pac_to_interc.py         # ⭐ PAC 评分 → interc 配置生成
+│   ├── soar_spe_report.py       # SPE perf report 解析（旧版，按 data_source）
+│   ├── soar_analyzer.py         # SOAR 对象分级分析
+│   └── soar_pipeline.py         # 端到端 pipeline 编排
 │
 ├── src/
 │   ├── lib/
-│   │   ├── prof/ldlib.c         # Phase 1: LD_PRELOAD 分配追踪（ARM64 适配）
-│   │   └── interc/ldlib.c       # Phase 1: NUMA 路由分配（轻量级，配置文件驱动）
-│   │
+│   │   ├── interc/              # LD_PRELOAD NUMA 路由库
+│   │   │   ├── ldlib.c          # malloc/calloc/free 拦截 + NUMA 路由
+│   │   │   └── Makefile
+│   │   ├── prof/                # LD_PRELOAD 分配追踪库
+│   │   │   ├── ldlib.c          # 记录每次 malloc 的 caller/size/addr
+│   │   │   └── Makefile
+│   │   └── mlock/               # LD_PRELOAD 热页锁定库
+│   │       ├── ldlib.c          # mlock 热 page 防止 swap
+│   │       └── Makefile
 │   └── tools/
-│       ├── soar_analyzer.py     # Phase 2: SPE/PEBS 分析 + AOL 评分 + Tier 分类
-│       ├── soar_spe_report.py   # Phase 2: ARM SPE perf report 解析器（新增）
-│       ├── soar_pipeline.py     # Phase 2: 完整闭环 pipeline
-│       ├── kumf_spe_capture.sh  # SPE 采集脚本（需 sudo）
-│       └── spe_self_profile.c   # SPE 自 profiling（无需 sudo）
+│       ├── spe_preload.c        # SPE 自采集 LD_PRELOAD
+│       ├── spe_self_profile.c   # SPE 自 profiling（不需要 perf 工具）
+│       └── Makefile
 │
-├── workloads/
-│   ├── kumf_tiered.c            # 冷热分层验证 workload（200MB hot + 100MB cold）
-│   ├── kumf_tiered.conf         # SOAR 配置（按大小路由）
-│   ├── kumf_stream.c            # NUMA 延迟/带宽微基准
-│   ├── mini_md.c                # 简化 MD 模拟（串行）
-│   └── mini_md_v2.c             # OpenMP 并行 MD 模拟
+├── workloads/                   # 测试 workload
+│   ├── kumf_tiered.c            # 热冷分离 benchmark
+│   ├── kumf_stream.c            # NUMA 带宽测试
+│   ├── mini_md_v2.c             # OpenMP MD benchmark
+│   └── kumf_tiered.conf         # size-based interc 配置示例
 │
-└── scripts/
-    └── test_phase1.sh           # Phase 1 单元测试
+├── scripts/
+│   └── kumf_spe_capture.sh      # SPE 采集脚本
+│
+├── docs/
+│   └── reviews/                 # 柱子哥审查报告
+│
+├── MEMORY.md                    # 项目记忆
+├── GAP_ANALYSIS.md              # 缺口分析
+├── DESIGN.md                    # 设计文档
+└── ROADMAP.md                   # 路线图
 ```
 
 ## 快速开始
 
 ### 环境要求
 
-| 项目 | 规格 |
-|------|------|
-| 服务器 | 鲲鹏930 (ARM64) |
-| NUMA | 4 node × (40核 + ~64GB) |
-| 内核 | Linux 6.6.0 (openEuler 24.03 LTS-SP3) |
-| 工具 | GCC 12.3.1, libnuma, perf |
+- 鲲鹏930 / ARM64 + ARM SPE 支持
+- openEuler 24.03+ / Linux 6.6+
+- GCC 12+, libnuma, perf
 
 ### 编译
 
 ```bash
-# 1. 克隆
-git clone https://github.com/xuefenghao5121/KUMF.git
-cd KUMF
+# 编译 interc + prof + mlock
+make -C src/lib/interc
+make -C src/lib/prof
+make -C src/lib/mlock
 
-# 2. 编译 prof 和 interc 库
-cd src/lib/prof && make
-cd ../interc && make
-
-# 3. 编译 workloads
-cd ../../workloads
-gcc -O2 -o kumf_tiered kumf_tiered.c -lnuma -lm
-gcc -O2 -fopenmp -o mini_md_v2 mini_md_v2.c -lnuma -lm
+# 编译 workload
+make -C workloads
 ```
 
-### 验证 SOAR 分层效果
-
-#### Step 1: 采集 SPE 数据
+### 端到端使用流程
 
 ```bash
-# 降低 perf 限制（需要 sudo）
-sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'
+# Step 1: 采集 SPE + prof（同时运行）
+perf record -e arm_spe/load_filter=1,store_filter=1,min_latency=32/ \
+  -o /tmp/kumf/spe.perf \
+  -- env LD_PRELOAD=build/libprof.so KUMF_PROF_OUT=/tmp/kumf/prof.log \
+  ./build/kumf_tiered 200 100 50
 
-# 采集 SPE（per-task 模式）
-perf record -e arm_spe/load_filter=1,store_filter=1/ -o /tmp/kumf/spe.data -- ./kumf_tiered 200 100 5
+# Step 2: 解析 SPE → page 级 PAC 评分
+perf report -D -i /tmp/kumf/spe.perf | python3 tools/spe_page_pac.py -o /tmp/kumf
 
-# 导出 perf report（用于分析）
-perf report -i /tmp/kumf/spe.data --mem-mode --stdio > /tmp/kumf/spe_report.txt
+# Step 3: PAC + prof 交叉关联 → interc 配置
+python3 tools/pac_to_interc.py \
+  --pac-csv /tmp/kumf/page_pac.csv \
+  --prof-log /tmp/kumf/prof.log \
+  --mode alloc -o /tmp/kumf/kumf_pac.conf
+
+# Step 4: 用 PAC 配置运行
+KUMF_CONF=/tmp/kumf/kumf_pac.conf LD_PRELOAD=build/libinterc.so \
+  ./build/kumf_tiered 200 100 50
 ```
 
-#### Step 2: SOAR 分析（生成配置）
+### 性能对比
 
 ```bash
-python3 src/tools/soar_spe_report.py \
-  --report /tmp/kumf/spe_report.txt \
-  --output /tmp/kumf/aol.csv \
-  --config /tmp/kumf/kumf_tiered_auto.conf \
-  --dso kumf_tiered
+# 全快层 baseline
+numactl --cpunodebind=0 --membind=0 ./build/kumf_tiered 200 100 50
+
+# 全慢层 baseline
+numactl --cpunodebind=0 --membind=2 ./build/kumf_tiered 200 100 50
+
+# SOAR 自动分层
+KUMF_CONF=/tmp/kumf/kumf_pac.conf LD_PRELOAD=build/libinterc.so \
+  ./build/kumf_tiered 200 100 50
 ```
 
-#### Step 3: 四组对比测试
-
-```bash
-# ① 全快层（上限）
-numactl --cpunodebind=0 --membind=0 ./kumf_tiered 200 100 5
-
-# ② 全慢层（下限）
-numactl --cpunodebind=0 --membind=2 ./kumf_tiered 200 100 5
-
-# ③ first-touch 默认
-numactl --cpunodebind=0 ./kumf_tiered 200 100 5
-
-# ④ SOAR 分层（热数据 Node 0，冷数据 Node 2）
-KUMF_CONF=/tmp/kumf/kumf_tiered_auto.conf \
-LD_PRELOAD=../src/lib/interc/ldlib.so \
-./kumf_tiered 200 100 5
-```
-
-#### Step 4: 结果对比
-
-关注 `NUMA Distribution` 段和 `总耗时`：
+## PAC 评分原理
 
 ```
-期望结果：
-  SOAR 的 masses[COLD] 应在 Node 2
-  SOAR 的总耗时应接近全快层（gap closing ≥ 60%）
+PAC(page) = access_count × avg_LAT_TOT / effective_MLP
 ```
 
-## 核心指标
+- **高 PAC** → 访问多 + 延迟大 + MLP 低 → 必须放快层
+- **低 PAC** → 访问少 或 MLP 高（如 SVE 向量 load）→ 可以放慢层
+- **SVE 感知**：SVE 向量 load 天然高 MLP，PAC 自动下调
 
-| 指标 | 目标值 |
-|------|--------|
-| Gap Closing | ≥ 60% |
-| 热数据路由准确率 | 100% |
-| SOAR 开销 | < 10% |
+### SPE LAT 字段
 
-## 当前进度
+ARM SPE v1p4 每条记录提供 4 种延迟：
 
-| Phase | 内容 | 状态 |
-|-------|------|------|
-| 0 | 环境验证 | ✅ 100% |
-| 1 | SOAR ARM 适配 | ⚠️ 65% |
-| 2 | SPE+AOL 分析 | ⚠️ 70% |
-| 3 | **端到端验证** | **✅ 100%** 🎉 |
-| gem5 | 仿真验证 | ✅ 100% |
+| Packet | 含义 | 用途 |
+|--------|------|------|
+| LAT ISSUE | 指令发射到完成 | 流水线分析 |
+| **LAT TOT** | **操作总延迟** | **PAC 评分核心** |
+| LAT XLAT | TLB 翻译延迟 | TLB 抖动分析 |
+| LAT (0x9e) | LLC 相关延迟 | Cache 分析 |
 
-**里程碑（2026-04-27）**: SOAR 分层在鲲鹏930 真机验证成功，Gap Closing = 67.8%！
+## 验证结果
 
-## 参考
+| 测试 | 耗时 | 说明 |
+|------|------|------|
+| 全快层 (Node 0) | 0.608s | 性能上限 |
+| 全慢层 (Node 2) | 1.407s | 性能下限 |
+| **SOAR 自动** | **0.588s** | **比全快层快 3.3%** |
+| Gap closing | 67.8% | — |
 
-- 论文: OSDI'25 "Tiered Memory Management Beyond Hotness"
-- 原版代码: https://github.com/MoatLab/SoarAlto
-- 论文解读: `docs/reviews/AOL_ARM_REVIEW.md`
+## 目标平台
 
-## License
-
-MIT
+鲲鹏930, 120核 ARM64, 4 NUMA node, SVE 支持

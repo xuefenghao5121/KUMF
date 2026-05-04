@@ -5,9 +5,14 @@
 *.pyc
 __pycache__/
 
-# SPE 数据
+# SPE/perf 数据
+perf.data
+perf_filtered.perf
 /tmp/kumf/
 
 # IDE
 .vscode/
 .idea/
+
+# 构建目录
+build/
