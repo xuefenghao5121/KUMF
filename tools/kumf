@@ -120,12 +120,16 @@ def cmd_diagnose(args):
         return 1
     
     paranoid = check_perf_paranoid()
-    if paranoid > 1:
+    is_root = os.geteuid() == 0
+    if paranoid > 1 and not is_root:
         print(f"⚠️  perf_event_paranoid={paranoid} (need ≤1 for SPE)")
         print(f"   Fix: sudo sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid'")
         print(f"   Or:  run as root")
         return 1
-    print(f"✅ perf_event_paranoid={paranoid}")
+    if paranoid > 1 and is_root:
+        print(f"✅ perf_event_paranoid={paranoid} (root user, bypass OK)")
+    else:
+        print(f"✅ perf_event_paranoid={paranoid}")
     print(f"✅ All tools available")
     print()
     
