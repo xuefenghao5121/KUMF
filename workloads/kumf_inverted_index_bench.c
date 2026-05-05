@@ -1,126 +1,322 @@
-/*
+/**
  * kumf_inverted_index_bench.c - 倒排索引搜索 benchmark (KUMF tiered memory)
  *
- * 天然冷热分离:
- *   词典 (dictionary):    HOT — 每条查询必查，随机访问
- *   Posting list pool:     WARM — 每条查询读几个 term 的 list
- *   文档原文 (doc_store):  COLD — 只取 top-K 时才读，极少访问
+ * 天然冷热分离，三个独立大 malloc：
+ *   dict_buf:      词典 hash table (热) — 每条查询反复随机访问
+ *   posting_buf:   Posting list 池 (温) — 每条查询扫描几个 term 的 list
+ *   doc_buf:       文档原文存储 (冷) — 只取 top-K 时读几条
  *
- * 三个区域是三个独立的 malloc，interc 按 size 路由:
- *   词典 (~200MB)  → 快层 (Node 0)
- *   Posting (~2GB)  → 温层 (first-touch)
- *   文档 (~10GB)    → 慢层 (Node 2)
+ * KUMF 自动 pipeline 应该能：
+ *   SPE 采样 → 词典区域高频访问 → 高 PAC → 快层
+ *   SPE 采样 → 文档区域几乎无访问 → 低 PAC → 慢层
+ *   PAC → interc 配置自动生成
  *
  * 用法:
- *   make workloads    # 编译
+ *   # 默认: 100万 term, 1000万文档, 1万条查询
+ *   ./kumf_inverted_index_bench
  *
- *   # 默认: 1千万文档, 1KB/文档 (~10GB doc_store)
- *   ./build/kumf_inverted_index_bench
+ *   # 大数据集 (~10GB 文档存储)
+ *   ./kumf_inverted_index_bench -n 10000000 -d 10000000 -l 1024
  *
- *   # 小规模测试
- *   ./build/kumf_inverted_index_bench 1000000 100000 1000
+ *   # KUMF 自动诊断
+ *   kumf diagnose -o /tmp/kumf -- ./kumf_inverted_index_bench -n 1000000 -d 10000000 -q 100000
  *
- *   # 对比: 全快层
- *   numactl --membind=0 ./build/kumf_inverted_index_bench
+ *   # KUMF 分层运行
+ *   kumf run --conf /tmp/kumf/kumf.conf -- ./kumf_inverted_index_bench -n 1000000 -d 10000000 -q 100000
  *
- *   # 对比: KUMF 分层
- *   KUMF_CONF=kumf_inverted.conf LD_PRELOAD=build/libkumf_interc.so \
- *     ./build/kumf_inverted_index_bench
- *
- * interc 配置 (kumf_inverted.conf):
- *   # 词典 (较小的大块) → 快层
- *   size_range:67108864-536870912 = 0
- *   # 文档原文 (最大块) → 慢层
- *   size_gt:536870912 = 2
+ *   # 对比
+ *   kumf bench --conf /tmp/kumf/kumf.conf -- ./kumf_inverted_index_bench [args]
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <getopt.h>
 #include <math.h>
-#include <unistd.h>
 
 /* ============================================================
- * 配置
+ * 数据结构
  * ============================================================ */
 
-#define DEFAULT_NUM_DOCS      10000000   /* 1千万文档 */
-#define DEFAULT_NUM_TERMS     1000000    /* 100万词 */
-#define DEFAULT_NUM_QUERIES   10000      /* 1万条查询 */
-#define DEFAULT_TOP_K         10
-#define AVG_DOC_LEN           100        /* 平均每文档 100 个词 */
-#define DOC_CONTENT_LEN       1024       /* 每文档 1KB 原文 */
-#define HASH_TABLE_LOAD       0.7        /* hash table 负载因子 */
-#define POSTING_AVG_LEN       50         /* 平均 posting list 长度 */
-
-/* ============================================================
- * 简易 hash table (开放寻址)
- * ============================================================ */
-
-typedef struct {
-    int64_t key;          /* term ID */
-    int     posting_off;  /* posting list 在 pool 中的偏移 */
-    int     posting_len;  /* posting list 长度 */
-    int     doc_freq;     /* 文档频率 (DF) */
+/* 词典条目: term_id → posting list 头 */
+typedef struct dict_entry {
+    int term_id;
+    int posting_offset;    /* posting_buf 中的偏移量 */
+    int posting_len;       /* posting list 长度 */
+    int df;                /* document frequency */
+    struct dict_entry *next; /* hash chain */
 } dict_entry_t;
 
+/* Posting list 条目: (doc_id, tf) 对 */
+typedef struct posting {
+    int doc_id;
+    int tf;                /* term frequency in doc */
+} posting_t;
+
+/* Top-K 堆 */
 typedef struct {
-    dict_entry_t *entries;
-    int64_t       capacity;
-    int64_t       size;
-    int64_t       mask;
-} dict_t;
+    int doc_id;
+    double score;
+} scored_doc_t;
 
-static dict_t *dict_create(int64_t capacity) {
-    dict_t *d = (dict_t *)malloc(sizeof(dict_t));
-    int64_t real_cap = 1;
-    while (real_cap < (int64_t)(capacity / HASH_TABLE_LOAD))
-        real_cap *= 2;
-    d->entries = (dict_entry_t *)calloc(real_cap, sizeof(dict_entry_t));
-    d->capacity = real_cap;
-    d->size = 0;
-    d->mask = real_cap - 1;
-    /* 标记空槽: key = -1 */
-    for (int64_t i = 0; i < real_cap; i++)
-        d->entries[i].key = -1;
-    return d;
+/* ============================================================
+ * 全局内存区域 — 三个独立大 malloc
+ * ============================================================ */
+
+/* 词典 hash table */
+static dict_entry_t *dict_table = NULL;  /* hash bucket 数组 */
+static int dict_buckets = 0;
+static dict_entry_t *dict_pool = NULL;   /* 预分配 dict_entry 池 */
+static int dict_pool_used = 0;
+
+/* Posting list 存储 */
+static posting_t *posting_buf = NULL;
+static int posting_buf_cap = 0;
+static int posting_buf_used = 0;
+
+/* 文档原文存储 */
+static char *doc_buf = NULL;
+static int doc_buf_size = 0;
+static int avg_doc_len = 0;
+
+/* 统计 */
+static long total_dict_lookups = 0;
+static long total_posting_scans = 0;
+static long total_doc_reads = 0;
+static size_t dict_bytes = 0;
+static size_t posting_bytes = 0;
+static size_t docstore_bytes = 0;
+
+/* ============================================================
+ * 词典操作 (热 — 每条查询反复随机访问)
+ * ============================================================ */
+
+static uint32_t hash_term(int term_id, int buckets) {
+    /* 简单但分散的 hash */
+    uint32_t h = (uint32_t)term_id;
+    h = ((h >> 16) ^ h) * 0x45d9f3b;
+    h = ((h >> 16) ^ h) * 0x45d9f3b;
+    h = (h >> 16) ^ h;
+    return h % buckets;
 }
 
-static void dict_insert(dict_t *d, int64_t key, int off, int len, int df) {
-    int64_t idx = (key * 2654435761ULL) & d->mask;
-    while (d->entries[idx].key != -1) {
-        idx = (idx + 1) & d->mask;
-    }
-    d->entries[idx].key = key;
-    d->entries[idx].posting_off = off;
-    d->entries[idx].posting_len = len;
-    d->entries[idx].doc_freq = df;
-    d->size++;
-}
-
-static dict_entry_t *dict_lookup(dict_t *d, int64_t key) {
-    int64_t idx = (key * 2654435761ULL) & d->mask;
-    while (d->entries[idx].key != -1) {
-        if (d->entries[idx].key == key)
-            return &d->entries[idx];
-        idx = (idx + 1) & d->mask;
+static dict_entry_t *dict_lookup(int term_id) {
+    total_dict_lookups++;
+    uint32_t idx = hash_term(term_id, dict_buckets);
+    dict_entry_t *e = &dict_table[idx];
+    /* 沿 hash chain 查找 */
+    while (e && e->term_id != -1) {
+        if (e->term_id == term_id)
+            return e;
+        if (e->next)
+            e = e->next;
+        else
+            return NULL;
     }
     return NULL;
 }
 
+static dict_entry_t *dict_insert(int term_id, int posting_offset, int posting_len, int df) {
+    uint32_t idx = hash_term(term_id, dict_buckets);
+    dict_entry_t *e = &dict_table[idx];
+
+    if (e->term_id == -1) {
+        /* 空 bucket */
+        e->term_id = term_id;
+        e->posting_offset = posting_offset;
+        e->posting_len = posting_len;
+        e->df = df;
+        e->next = NULL;
+        return e;
+    }
+
+    /* 冲突: 从 pool 分配新节点，插到链表头 */
+    dict_entry_t *ne = &dict_pool[dict_pool_used++];
+    ne->term_id = term_id;
+    ne->posting_offset = posting_offset;
+    ne->posting_len = posting_len;
+    ne->df = df;
+    ne->next = e->next;
+    e->next = ne; /* 插到第二个位置（保持 bucket head 不变） */
+    return ne;
+}
+
 /* ============================================================
- * 查询结果 (top-K)
+ * 索引构建
  * ============================================================ */
 
-typedef struct {
-    int    doc_id;
-    double score;
-} result_t;
+static void build_index(int num_terms, int num_docs, int max_posting_per_term) {
+    /* 分配词典 hash table */
+    dict_buckets = num_terms * 2 + 1;
+    dict_table = (dict_entry_t *)calloc(dict_buckets, sizeof(dict_entry_t));
+    if (!dict_table) { perror("malloc dict_table"); exit(1); }
+    /* 初始化为空 */
+    for (int i = 0; i < dict_buckets; i++)
+        dict_table[i].term_id = -1;
+
+    dict_pool = (dict_entry_t *)malloc(num_terms * sizeof(dict_entry_t));
+    if (!dict_pool) { perror("malloc dict_pool"); exit(1); }
+    dict_pool_used = 0;
+
+    dict_bytes = dict_buckets * sizeof(dict_entry_t) + num_terms * sizeof(dict_entry_t);
+
+    /* 分配 posting buffer */
+    posting_buf_cap = num_terms * max_posting_per_term;
+    posting_buf = (posting_t *)malloc((size_t)posting_buf_cap * sizeof(posting_t));
+    if (!posting_buf) { perror("malloc posting_buf"); exit(1); }
+    posting_buf_used = 0;
+
+    /* 分配文档存储 */
+    doc_buf_size = num_docs * avg_doc_len;
+    doc_buf = (char *)malloc(doc_buf_size);
+    if (!doc_buf) { perror("malloc doc_buf"); exit(1); }
+    /* 填充假文档内容 */
+    memset(doc_buf, 'A' + (rand() % 26), doc_buf_size);
+    /* 每个 doc 末尾加 \0 */
+    for (int i = 0; i < num_docs; i++)
+        doc_buf[i * avg_doc_len + avg_doc_len - 1] = '\0';
+
+    /* 生成倒排索引 */
+    srand(42);
+    for (int t = 0; t < num_terms; t++) {
+        /* 每个 term 的 posting list 长度: Zipf-like 分布 */
+        int df = 1 + (int)(num_docs * 0.001 / (1.0 + t * 0.001));
+        if (df > max_posting_per_term) df = max_posting_per_term;
+        if (df > num_docs) df = num_docs;
+        if (posting_buf_used + df > posting_buf_cap) df = posting_buf_cap - posting_buf_used;
+        if (df <= 0) continue;
+
+        int offset = posting_buf_used;
+        for (int d = 0; d < df; d++) {
+            /* 随机 doc_id, 避免重复 (简化: 随机但不严格去重) */
+            posting_buf[posting_buf_used].doc_id = rand() % num_docs;
+            posting_buf[posting_buf_used].tf = 1 + rand() % 10;
+            posting_buf_used++;
+        }
+
+        dict_insert(t, offset, df, df);
+    }
+
+    posting_bytes = (size_t)posting_buf_cap * sizeof(posting_t);
+    docstore_bytes = (size_t)doc_buf_size;
+}
 
 /* ============================================================
- * 时间工具
+ * 查询处理
+ * ============================================================ */
+
+static int score_cmp(const void *a, const void *b) {
+    double sa = ((scored_doc_t *)a)->score;
+    double sb = ((scored_doc_t *)b)->score;
+    if (sb > sa) return 1;
+    if (sb < sa) return -1;
+    return 0;
+}
+
+/**
+ * 执行一条查询: 查词典 → 扫描 posting → 评分 → 取 top-K 文档原文
+ *
+ * @param query_terms  查询中的 term_id 数组
+ * @param num_terms    查询 term 数
+ * @param num_docs     总文档数
+ * @param top_k        返回 top-K
+ * @param result_buf   结果缓冲区
+ * @return             命中文档数
+ */
+static int execute_query(int *query_terms, int num_query_terms, int num_docs,
+                         int top_k, scored_doc_t *result_buf) {
+    /* 临时评分数组 (栈上分配, 小量) */
+    double *scores = (double *)calloc(num_docs, sizeof(double));
+    if (!scores) return 0;
+
+    int *seen = (int *)calloc(num_docs, sizeof(int));
+    if (!seen) { free(scores); return 0; }
+
+    int total_hits = 0;
+
+    for (int t = 0; t < num_query_terms; t++) {
+        /* Step 1: 词典查找 (热!) */
+        dict_entry_t *entry = dict_lookup(query_terms[t]);
+        if (!entry) continue;
+
+        /* Step 2: 扫描 posting list (温) */
+        double idf = log((double)num_docs / (1 + entry->df));
+        for (int p = 0; p < entry->posting_len; p++) {
+            posting_t *pe = &posting_buf[entry->posting_offset + p];
+            int did = pe->doc_id;
+            if (did < 0 || did >= num_docs) continue;
+            scores[did] += pe->tf * idf;
+            if (!seen[did]) {
+                seen[did] = 1;
+                total_hits++;
+            }
+        }
+        total_posting_scans += entry->posting_len;
+    }
+
+    /* Step 3: 收集评分 > 0 的文档, 排序取 top-K */
+    int n_results = 0;
+    for (int d = 0; d < num_docs && n_results < top_k * 10; d++) {
+        if (seen[d] && scores[d] > 0) {
+            result_buf[n_results].doc_id = d;
+            result_buf[n_results].score = scores[d];
+            n_results++;
+        }
+    }
+
+    qsort(result_buf, n_results, sizeof(scored_doc_t), score_cmp);
+    if (n_results > top_k)
+        n_results = top_k;
+
+    /* Step 4: 读 top-K 文档原文 (冷!) */
+    for (int k = 0; k < n_results; k++) {
+        int did = result_buf[k].doc_id;
+        /* 实际读文档内容 — 触发 doc_buf 的内存访问 */
+        volatile char c = doc_buf[did * avg_doc_len];
+        (void)c;
+        total_doc_reads++;
+    }
+
+    free(scores);
+    free(seen);
+    return n_results;
+}
+
+/* ============================================================
+ * NUMA 统计
+ * ============================================================ */
+
+static void print_numa_stats(void) {
+    FILE *f = popen("numastat -p $$ 2>/dev/null", "r");
+    if (f) {
+        char buf[1024];
+        while (fgets(buf, sizeof(buf), f))
+            printf("  %s", buf);
+        pclose(f);
+    }
+}
+
+static void print_proc_status(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (f) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), f)) {
+            if (strncmp(buf, "VmRSS:", 6) == 0 ||
+                strncmp(buf, "VmHWM:", 6) == 0 ||
+                strncmp(buf, "VmSize:", 7) == 0)
+                printf("  %s", buf);
+        }
+        fclose(f);
+    }
+}
+
+/* ============================================================
+ * 主函数
  * ============================================================ */
 
 static double now_sec(void) {
@@ -129,309 +325,205 @@ static double now_sec(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* ============================================================
- * 主逻辑
- * ============================================================ */
+static void usage(const char *prog) {
+    printf("Usage: %s [options]\n", prog);
+    printf("  -n, --num-terms     Number of unique terms in dictionary (default: 1000000)\n");
+    printf("  -d, --num-docs      Number of documents (default: 10000000)\n");
+    printf("  -l, --doc-len       Average document length in bytes (default: 1024)\n");
+    printf("  -q, --queries       Number of queries to execute (default: 10000)\n");
+    printf("  -t, --terms-per-q   Terms per query (default: 3)\n");
+    printf("  -k, --top-k         Return top-K results (default: 10)\n");
+    printf("  -r, --rounds        Number of query rounds (default: 3)\n");
+    printf("  -h, --help          Show this help\n");
+    printf("\n");
+    printf("Memory estimates (default params):\n");
+    printf("  Dictionary:     ~%zu MB\n", (size_t)(2000000 * sizeof(dict_entry_t)) / 1024 / 1024);
+    printf("  Posting lists:  ~%zu MB\n", (size_t)(1000000 * 20 * sizeof(posting_t)) / 1024 / 1024);
+    printf("  Document store: ~%zu MB\n", (size_t)10000000 * 1024 / 1024 / 1024);
+}
 
-int main(int argc, char *argv[]) {
-    int64_t num_docs    = (argc > 1) ? atoll(argv[1]) : DEFAULT_NUM_DOCS;
-    int64_t num_terms   = (argc > 2) ? atoll(argv[2]) : DEFAULT_NUM_TERMS;
-    int64_t num_queries = (argc > 3) ? atoll(argv[3]) : DEFAULT_NUM_QUERIES;
-    int     top_k       = (argc > 4) ? atoi(argv[4])  : DEFAULT_TOP_K;
+int main(int argc, char **argv) {
+    int num_terms = 1000000;
+    int num_docs = 10000000;
+    int avg_doc_len_param = 1024;
+    int num_queries = 10000;
+    int terms_per_query = 3;
+    int top_k = 10;
+    int num_rounds = 3;
 
-    printf("============================================================\n");
+    static struct option long_opts[] = {
+        {"num-terms",    required_argument, 0, 'n'},
+        {"num-docs",     required_argument, 0, 'd'},
+        {"doc-len",      required_argument, 0, 'l'},
+        {"queries",      required_argument, 0, 'q'},
+        {"terms-per-q",  required_argument, 0, 't'},
+        {"top-k",        required_argument, 0, 'k'},
+        {"rounds",       required_argument, 0, 'r'},
+        {"help",         no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "n:d:l:q:t:k:r:h", long_opts, NULL)) != -1) {
+        switch (opt) {
+        case 'n': num_terms = atoi(optarg); break;
+        case 'd': num_docs = atoi(optarg); break;
+        case 'l': avg_doc_len_param = atoi(optarg); break;
+        case 'q': num_queries = atoi(optarg); break;
+        case 't': terms_per_query = atoi(optarg); break;
+        case 'k': top_k = atoi(optarg); break;
+        case 'r': num_rounds = atoi(optarg); break;
+        case 'h': usage(argv[0]); return 0;
+        default: usage(argv[0]); return 1;
+        }
+    }
+
+    avg_doc_len = avg_doc_len_param;
+    int max_posting_per_term = 20; /* 每个 term 最多 20 个 posting */
+
+    printf("================================================================\n");
     printf("  KUMF Inverted Index Search Benchmark\n");
-    printf("  Tiered Memory Validation\n");
-    printf("============================================================\n");
-    printf("  Documents:     %lld\n", (long long)num_docs);
-    printf("  Terms:         %lld\n", (long long)num_terms);
-    printf("  Queries:       %lld\n", (long long)num_queries);
-    printf("  Top-K:         %d\n", top_k);
+    printf("  Tiered Memory Validation — Natural Hot/Cold Separation\n");
+    printf("================================================================\n");
+    printf("  Terms:       %d (dictionary entries)\n", num_terms);
+    printf("  Documents:   %d (doc store)\n", num_docs);
+    printf("  Doc length:  %d bytes\n", avg_doc_len);
+    printf("  Queries:     %d x %d rounds, %d terms/query, top-%d\n",
+           num_queries, num_rounds, terms_per_query, top_k);
     printf("\n");
 
-    /* ---- 估算内存 ---- */
-    int64_t dict_bytes = (int64_t)(num_terms / HASH_TABLE_LOAD) * sizeof(dict_entry_t);
-    int64_t posting_bytes = num_terms * POSTING_AVG_LEN * sizeof(int);
-    int64_t doc_store_bytes = num_docs * DOC_CONTENT_LEN;
+    /* 估算内存 */
+    size_t est_dict = (size_t)(num_terms * 2 + 1) * sizeof(dict_entry_t) + num_terms * sizeof(dict_entry_t);
+    size_t est_posting = (size_t)num_terms * max_posting_per_term * sizeof(posting_t);
+    size_t est_docs = (size_t)num_docs * avg_doc_len;
+    size_t est_total = est_dict + est_posting + est_docs;
 
-    double dict_mb = dict_bytes / (1024.0 * 1024.0);
-    double posting_mb = posting_bytes / (1024.0 * 1024.0);
-    double doc_mb = doc_store_bytes / (1024.0 * 1024.0);
-    double total_mb = dict_mb + posting_mb + doc_mb;
-
-    printf("  Memory estimate:\n");
-    printf("    Dictionary:    %8.1f MB  (HOT  — 每条查询随机访问)\n", dict_mb);
-    printf("    Posting pool:  %8.1f MB  (WARM — 顺序扫描几个 term)\n", posting_mb);
-    printf("    Doc store:     %8.1f MB  (COLD — 只取 top-K 时读)\n", doc_mb);
-    printf("    Total:         %8.1f MB\n", total_mb);
+    printf("  Estimated memory:\n");
+    printf("    Dictionary:     %8.1f MB  (HOT — every query hits)\n", est_dict / 1024.0 / 1024.0);
+    printf("    Posting lists:  %8.1f MB  (WARM — scan per term)\n", est_posting / 1024.0 / 1024.0);
+    printf("    Document store: %8.1f MB  (COLD — only read top-K docs)\n", est_docs / 1024.0 / 1024.0);
+    printf("    Total:          %8.1f MB\n", est_total / 1024.0 / 1024.0);
     printf("\n");
 
     /* KUMF 环境检测 */
-    const char *kumf_conf = getenv("KUMF_CONF");
     const char *ld_preload = getenv("LD_PRELOAD");
-    if (kumf_conf || (ld_preload && strstr(ld_preload, "kumf"))) {
-        printf("  KUMF interc:  ✅ enabled\n");
-        if (kumf_conf) printf("  KUMF conf:    %s\n", kumf_conf);
+    const char *kumf_conf = getenv("KUMF_CONF");
+    if (ld_preload && strstr(ld_preload, "kumf")) {
+        printf("  KUMF interc:  ✅ %s\n", ld_preload);
+        if (kumf_conf)
+            printf("  KUMF conf:    %s\n", kumf_conf);
     } else {
         printf("  KUMF interc:  ❌ (bare run, no tiered memory)\n");
     }
     printf("\n");
 
-    /* ---- Phase 1: 构建词典 + posting list ---- */
-    printf("── Phase 1: Build Dictionary + Posting Lists ──────\n");
+    /* === Phase 1: 构建索引 === */
+    printf("── Phase 1: Build Inverted Index ─────────────────────\n");
     double t0 = now_sec();
-
-    /* 1a. 创建词典 */
-    dict_t *dict = dict_create(num_terms);
-
-    /* 1b. 分配 posting pool */
-    int *posting_pool = (int *)malloc(posting_bytes);
-    if (!posting_pool) {
-        fprintf(stderr, "ERROR: failed to allocate posting pool (%lld bytes)\n",
-                (long long)posting_bytes);
-        return 1;
-    }
-
-    /* 1c. 填充词典和 posting list (模拟真实分布: Zipf) */
-    srand(42);
-    int posting_offset = 0;
-
-    for (int64_t t = 0; t < num_terms; t++) {
-        /* Zipf 分布: 高频词的 posting list 更长 */
-        double zipf = 1.0 / pow((double)(t + 1), 0.8);
-        int list_len = (int)(POSTING_AVG_LEN * zipf * num_terms / (num_terms * 0.5));
-        if (list_len < 1) list_len = 1;
-        if (list_len > num_docs) list_len = (int)num_docs;
-        if (posting_offset + list_len > posting_bytes / (int)sizeof(int)) {
-            list_len = (posting_bytes / (int)sizeof(int)) - posting_offset;
-            if (list_len <= 0) break;
-        }
-
-        /* 填充 posting list (随机文档 ID，已排序) */
-        int *list = posting_pool + posting_offset;
-        for (int i = 0; i < list_len; i++) {
-            list[i] = (int)(rand() % num_docs);
-        }
-        /* posting list in real search engine is sorted, simulation ok without */
-
-        dict_insert(dict, t, posting_offset, list_len, list_len);
-        posting_offset += list_len;
-    }
-
-    double t_build_dict = now_sec() - t0;
-    printf("  Dictionary: %lld entries, %.1f MB\n", (long long)dict->size, dict_mb);
-    printf("  Posting pool: %d entries used, %.1f MB\n", posting_offset, posting_mb);
-    printf("  Build time: %.2fs\n", t_build_dict);
+    build_index(num_terms, num_docs, max_posting_per_term);
+    double t_build = now_sec() - t0;
+    printf("  Index built: %.2fs\n", t_build);
+    printf("  Dict entries used: %d (pool) + %d (buckets)\n", dict_pool_used, dict_buckets);
+    printf("  Posting entries:   %d / %d\n", posting_buf_used, posting_buf_cap);
+    printf("  Actual memory:\n");
+    printf("    Dictionary:     %8.1f MB\n", dict_bytes / 1024.0 / 1024.0);
+    printf("    Posting lists:  %8.1f MB\n", posting_bytes / 1024.0 / 1024.0);
+    printf("    Document store: %8.1f MB\n", docstore_bytes / 1024.0 / 1024.0);
     printf("\n");
 
-    /* ---- Phase 2: 构建文档存储 ---- */
-    printf("── Phase 2: Build Document Store ───────────────────\n");
+    /* === Phase 2: 生成查询 === */
+    printf("── Phase 2: Generate Queries ─────────────────────────\n");
     t0 = now_sec();
-
-    char *doc_store = (char *)malloc(doc_store_bytes);
-    if (!doc_store) {
-        fprintf(stderr, "ERROR: failed to allocate doc store (%lld bytes)\n",
-                (long long)doc_store_bytes);
-        return 1;
+    int *all_query_terms = (int *)malloc(num_queries * terms_per_query * sizeof(int));
+    for (int q = 0; q < num_queries * terms_per_query; q++) {
+        /* Zipf-like: 少量热 term 被大量查询, 大量冷 term 很少被查 */
+        /* 这和搜索引擎的真实分布一致 */
+        double u = (double)rand() / RAND_MAX;
+        int tid = (int)(num_terms * pow(u, 3.0)); /* u^3 偏向小 term_id */
+        if (tid >= num_terms) tid = num_terms - 1;
+        all_query_terms[q] = tid;
     }
-
-    /* 填充模拟文档内容 (随机字节) */
-    for (int64_t i = 0; i < doc_store_bytes; i++) {
-        doc_store[i] = (char)('A' + (rand() % 26));
-    }
-
-    double t_build_docs = now_sec() - t0;
-    printf("  Doc store: %lld docs x %d bytes = %.1f MB\n",
-           (long long)num_docs, DOC_CONTENT_LEN, doc_mb);
-    printf("  Build time: %.2fs\n", t_build_docs);
+    double t_qgen = now_sec() - t0;
+    printf("  %d queries generated (%d terms each): %.3fs\n", num_queries, terms_per_query, t_qgen);
+    printf("  Query distribution: Zipf-like (hot terms queried heavily)\n");
     printf("\n");
 
-    /* ---- Phase 3: 查询 benchmark ---- */
-    printf("── Phase 3: Query Benchmark ───────────────────────\n");
+    /* === Phase 3: 查询 benchmark === */
+    printf("── Phase 3: Query Benchmark ─────────────────────────\n");
 
-    /* 生成随机查询 (每个查询 2-5 个 term) */
-    int *query_terms = (int *)malloc(num_queries * 5 * sizeof(int));
-    int *query_lens = (int *)malloc(num_queries * sizeof(int));
-    for (int64_t q = 0; q < num_queries; q++) {
-        query_lens[q] = 2 + (rand() % 4);  /* 2-5 terms per query */
-        for (int t = 0; t < query_lens[q]; t++) {
-            /* 查询偏向高频词 (真实搜索模式) */
-            query_terms[q * 5 + t] = (int)(rand() % (num_terms / 10));
-        }
-    }
+    scored_doc_t *result_buf = (scored_doc_t *)malloc(top_k * 10 * sizeof(scored_doc_t));
 
-    /* Warmup */
-    int warmup = 100;
-    for (int q = 0; q < warmup && q < num_queries; q++) {
-        for (int t = 0; t < query_lens[q]; t++) {
-            int64_t tid = query_terms[q * 5 + t];
-            dict_entry_t *e = dict_lookup(dict, tid);
-            if (e) {
-                volatile int *p = posting_pool + e->posting_off;
-                (void)p[0];
-            }
-        }
-    }
+    double total_qps = 0;
+    double best_qps = 1e18;
+    double worst_qps = 0;
 
-    /* 正式查询: 3 轮取稳定结果 */
-    int rounds = 3;
-    double latencies[3];
-    int64_t total_docs_retrieved = 0;
+    for (int round = 0; round < num_rounds; round++) {
+        total_dict_lookups = 0;
+        total_posting_scans = 0;
+        total_doc_reads = 0;
 
-    printf("  Running %d rounds x %lld queries...\n", rounds, (long long)num_queries);
-
-    for (int r = 0; r < rounds; r++) {
         t0 = now_sec();
-        total_docs_retrieved = 0;
-
-        for (int64_t q = 0; q < num_queries; q++) {
-            /* Step 1: 词典查找 (HOT — 随机访问) */
-            result_t results[64];
-            int n_results = 0;
-
-            for (int t = 0; t < query_lens[q]; t++) {
-                int64_t tid = query_terms[q * 5 + t];
-                dict_entry_t *e = dict_lookup(dict, tid);
-                if (!e) continue;
-
-                /* Step 2: 扫描 posting list (WARM — 顺序读) */
-                int *list = posting_pool + e->posting_off;
-                for (int i = 0; i < e->posting_len && n_results < 64; i++) {
-                    int doc_id = list[i];
-                    /* TF-IDF 简易评分 */
-                    double tf = 1.0;
-                    double idf = log((double)num_docs / (e->doc_freq + 1));
-                    double score = tf * idf;
-
-                    /* 插入结果 (简单实现) */
-                    int inserted = 0;
-                    for (int j = 0; j < n_results; j++) {
-                        if (results[j].doc_id == doc_id) {
-                            results[j].score += score;
-                            inserted = 1;
-                            break;
-                        }
-                    }
-                    if (!inserted && n_results < 64) {
-                        results[n_results].doc_id = doc_id;
-                        results[n_results].score = score;
-                        n_results++;
-                    }
-                }
-            }
-
-            /* Step 3: 排序取 top-K */
-            for (int i = 0; i < n_results - 1; i++) {
-                for (int j = i + 1; j < n_results; j++) {
-                    if (results[j].score > results[i].score) {
-                        result_t tmp = results[i];
-                        results[i] = results[j];
-                        results[j] = tmp;
-                    }
-                }
-            }
-
-            /* Step 4: 读取 top-K 文档原文 (COLD — 极少访问) */
-            for (int i = 0; i < top_k && i < n_results; i++) {
-                int doc_id = results[i].doc_id;
-                if (doc_id >= 0 && doc_id < num_docs) {
-                    char *doc = doc_store + (int64_t)doc_id * DOC_CONTENT_LEN;
-                    /* 模拟读取: 访问前 64 字节 (标题/摘要) */
-                    volatile char first_char = doc[0];
-                    (void)first_char;
-                    total_docs_retrieved++;
-                }
-            }
+        for (int q = 0; q < num_queries; q++) {
+            int *qt = &all_query_terms[q * terms_per_query];
+            execute_query(qt, terms_per_query, num_docs, top_k, result_buf);
         }
+        double t_query = now_sec() - t0;
 
-        latencies[r] = now_sec() - t0;
+        double qps = num_queries / t_query;
+        double lat_us = t_query / num_queries * 1e6;
+
+        total_qps += qps;
+        if (qps < best_qps) best_qps = qps;
+        if (qps > worst_qps) worst_qps = qps;
+
+        printf("  Round %d: %.3fs, %.0f QPS, %.1f μs/query"
+               " (dict=%ld post=%ld doc_read=%ld)\n",
+               round + 1, t_query, qps, lat_us,
+               total_dict_lookups, total_posting_scans, total_doc_reads);
     }
 
-    double total_time = 0;
-    double best_time = 1e9, worst_time = 0;
-    for (int r = 0; r < rounds; r++) {
-        double qps = num_queries / latencies[r];
-        double lat_us = latencies[r] / num_queries * 1e6;
-        printf("    Round %d: %.3fs, %.0f QPS, %.1f μs/query\n",
-               r + 1, latencies[r], qps, lat_us);
-        total_time += latencies[r];
-        if (latencies[r] < best_time) best_time = latencies[r];
-        if (latencies[r] > worst_time) worst_time = latencies[r];
-    }
-
-    double avg_time = total_time / rounds;
-    double avg_qps = num_queries / avg_time;
-    double avg_lat_us = avg_time / num_queries * 1e6;
+    double avg_qps = total_qps / num_rounds;
+    double avg_lat = num_queries / avg_qps / num_queries * 1e6;
 
     printf("\n");
-    printf("  ┌──────────────────────────────────────────┐\n");
-    printf("  │  Avg QPS:       %10.0f               │\n", avg_qps);
-    printf("  │  Avg latency:   %10.1f μs            │\n", avg_lat_us);
-    printf("  │  Best QPS:      %10.0f               │\n", num_queries / best_time);
-    printf("  │  Worst QPS:     %10.0f               │\n", num_queries / worst_time);
-    printf("  │  Docs retrieved: %10lld             │\n", (long long)total_docs_retrieved);
-    printf("  └──────────────────────────────────────────┘\n");
+    printf("  ┌──────────────────────────────────────────────┐\n");
+    printf("  │  Avg QPS:       %10.0f                  │\n", avg_qps);
+    printf("  │  Avg latency:   %10.1f μs                │\n", avg_lat);
+    printf("  │  Best QPS:      %10.0f                  │\n", worst_qps);
+    printf("  │  Worst QPS:     %10.0f                  │\n", best_qps);
+    printf("  └──────────────────────────────────────────────┘\n");
     printf("\n");
 
-    /* ---- Phase 4: NUMA 分布 ---- */
-    printf("── Phase 4: NUMA Memory Distribution ──────────────\n");
-    {
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "numastat -p %d 2>/dev/null", getpid());
-        int ret = system(cmd);
-        if (ret != 0) {
-            printf("  (numastat not available)\n");
-        }
-    }
-
-    /* /proc/self/status */
-    {
-        FILE *f = fopen("/proc/self/status", "r");
-        if (f) {
-            char line[256];
-            while (fgets(line, sizeof(line), f)) {
-                if (strncmp(line, "VmRSS:", 6) == 0 ||
-                    strncmp(line, "VmHWM:", 6) == 0) {
-                    printf("  %s", line);
-                }
-            }
-            fclose(f);
-        }
-    }
+    /* === Phase 4: 内存 / NUMA 统计 === */
+    printf("── Phase 4: Memory & NUMA Statistics ────────────────\n");
+    print_proc_status();
+    print_numa_stats();
     printf("\n");
 
-    /* ---- Summary ---- */
-    printf("============================================================\n");
+    /* === Summary === */
+    printf("================================================================\n");
     printf("  SUMMARY\n");
-    printf("  build_dict=%.2fs  build_docs=%.2fs\n", t_build_dict, t_build_docs);
-    printf("  query=%.3fs (%.0f QPS)\n", avg_time, avg_qps);
+    printf("  build=%.2fs  query=%.1f QPS (avg over %d rounds)\n",
+           t_build, avg_qps, num_rounds);
     printf("  Memory: dict=%.0fMB(HOT) + posting=%.0fMB(WARM) + docs=%.0fMB(COLD)\n",
-           dict_mb, posting_mb, doc_mb);
-    printf("  Routing: dict→快层(small big malloc) | docs→慢层(biggest malloc)\n");
-    printf("============================================================\n");
-
-    /* ---- 输出 interc 配置建议 ---- */
-    printf("\n");
-    printf("── Suggested interc config (kumf_inverted.conf) ────\n");
-    printf("# 词典 (%.0fMB) → 快层\n", dict_mb);
-    if (dict_bytes < (1LL << 30)) {
-        printf("size_range:%lld-%lld = 0\n",
-               (long long)dict_bytes,
-               (long long)(dict_bytes * 2));
-    } else {
-        printf("# 词典 > 1GB, use size_range to match\n");
-    }
-    printf("# 文档原文 (%.0fMB) → 慢层\n", doc_mb);
-    printf("size_gt:%lld = 2\n", (long long)(doc_store_bytes / 2));
-    printf("\n");
+           dict_bytes / 1024.0 / 1024.0,
+           posting_bytes / 1024.0 / 1024.0,
+           docstore_bytes / 1024.0 / 1024.0);
+    printf("  Access: dict_lookups=%ld posting_scans=%ld doc_reads=%ld\n",
+           total_dict_lookups, total_posting_scans, total_doc_reads);
+    printf("  Expected KUMF behavior:\n");
+    printf("    SPE → dict region: HIGH frequency → HIGH PAC → fast tier (Node 0)\n");
+    printf("    SPE → posting region: MEDIUM frequency → MEDIUM PAC\n");
+    printf("    SPE → doc_store region: LOW frequency → LOW PAC → slow tier (Node 2)\n");
+    printf("================================================================\n");
 
     /* 清理 */
-    free(doc_store);
-    free(posting_pool);
-    free(dict->entries);
-    free(dict);
-    free(query_terms);
-    free(query_lens);
+    free(dict_table);
+    free(dict_pool);
+    free(posting_buf);
+    free(doc_buf);
+    free(all_query_terms);
+    free(result_buf);
 
     return 0;
 }
