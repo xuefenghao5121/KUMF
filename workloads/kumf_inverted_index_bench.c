@@ -228,15 +228,20 @@ static int score_cmp(const void *a, const void *b) {
  * @param result_buf   结果缓冲区
  * @return             命中文档数
  */
+/**
+ * 执行一条查询: 查词典 → 扫描 posting → 评分 → 取 top-K 文档原文
+ *
+ * scores/seen 由调用者预分配，查询间复用，避免 mmap/munmap 开销。
+ * 每次调用前调用者需 reset_scores() 清零。
+ */
+static void reset_scores(double *scores, int *seen, int num_docs) {
+    memset(scores, 0, num_docs * sizeof(double));
+    memset(seen, 0, num_docs * sizeof(int));
+}
+
 static int execute_query(int *query_terms, int num_query_terms, int num_docs,
-                         int top_k, scored_doc_t *result_buf) {
-    /* 临时评分数组 (栈上分配, 小量) */
-    double *scores = (double *)calloc(num_docs, sizeof(double));
-    if (!scores) return 0;
-
-    int *seen = (int *)calloc(num_docs, sizeof(int));
-    if (!seen) { free(scores); return 0; }
-
+                         int top_k, scored_doc_t *result_buf,
+                         double *scores, int *seen) {
     int total_hits = 0;
 
     for (int t = 0; t < num_query_terms; t++) {
@@ -282,8 +287,6 @@ static int execute_query(int *query_terms, int num_query_terms, int num_docs,
         total_doc_reads++;
     }
 
-    free(scores);
-    free(seen);
     return n_results;
 }
 
@@ -453,6 +456,14 @@ int main(int argc, char **argv) {
 
     scored_doc_t *result_buf = (scored_doc_t *)malloc(top_k * 10 * sizeof(scored_doc_t));
 
+    /* 预分配 scores/seen — 查询间复用，避免每条查询 calloc+free 大数组 */
+    double *scores = (double *)malloc(num_docs * sizeof(double));
+    int *seen = (int *)malloc(num_docs * sizeof(int));
+    if (!scores || !seen) {
+        fprintf(stderr, "Failed to allocate scores/seen buffers (%d docs)\n", num_docs);
+        return 1;
+    }
+
     double total_qps = 0;
     double best_qps = 1e18;
     double worst_qps = 0;
@@ -465,7 +476,9 @@ int main(int argc, char **argv) {
         t0 = now_sec();
         for (int q = 0; q < num_queries; q++) {
             int *qt = &all_query_terms[q * terms_per_query];
-            execute_query(qt, terms_per_query, num_docs, top_k, result_buf);
+            reset_scores(scores, seen, num_docs);
+            execute_query(qt, terms_per_query, num_docs, top_k, result_buf,
+                          scores, seen);
         }
         double t_query = now_sec() - t0;
 
@@ -524,6 +537,8 @@ int main(int argc, char **argv) {
     free(doc_buf);
     free(all_query_terms);
     free(result_buf);
+    free(scores);
+    free(seen);
 
     return 0;
 }
