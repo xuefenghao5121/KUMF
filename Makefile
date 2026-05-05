@@ -78,7 +78,7 @@ $(BUILD_DIR)/libkumf_mlock.so: src/lib/mlock/ldlib.c | $(BUILD_DIR)
 # Test Workloads
 # ============================================================
 
-workloads: $(BUILD_DIR)/kumf_tiered $(BUILD_DIR)/kumf_stream $(BUILD_DIR)/mini_md_v2
+workloads: $(BUILD_DIR)/kumf_tiered $(BUILD_DIR)/kumf_stream $(BUILD_DIR)/mini_md_v2 $(BUILD_DIR)/kumf_inverted_index
 
 $(BUILD_DIR)/kumf_tiered: workloads/kumf_tiered.c | $(BUILD_DIR)
 	$(CC) -Wall -O2 -g -fopenmp -D_GNU_SOURCE $(NUMA_CFLAGS) \
@@ -90,6 +90,10 @@ $(BUILD_DIR)/kumf_stream: workloads/kumf_stream.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/mini_md_v2: workloads/mini_md_v2.c | $(BUILD_DIR)
 	$(CC) -Wall -O2 -g -fopenmp -D_GNU_SOURCE $(NUMA_CFLAGS) \
+		-o $@ $< $(NUMA_LDFLAGS) -lm -lpthread
+
+$(BUILD_DIR)/kumf_inverted_index: workloads/kumf_inverted_index_bench.c | $(BUILD_DIR)
+	$(CC) -Wall -O2 -g -D_GNU_SOURCE $(NUMA_CFLAGS) \
 		-o $@ $< $(NUMA_LDFLAGS) -lm -lpthread
 
 # ============================================================
