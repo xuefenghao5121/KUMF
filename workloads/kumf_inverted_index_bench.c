@@ -81,7 +81,7 @@ static int posting_buf_used = 0;
 
 /* 文档原文存储 */
 static char *doc_buf = NULL;
-static int doc_buf_size = 0;
+static size_t doc_buf_size = 0;
 static int avg_doc_len = 0;
 
 /* 统计 */
@@ -172,14 +172,14 @@ static void build_index(int num_terms, int num_docs, int max_posting_per_term) {
     posting_buf_used = 0;
 
     /* 分配文档存储 */
-    doc_buf_size = num_docs * avg_doc_len;
+    doc_buf_size = (size_t)num_docs * avg_doc_len;
     doc_buf = (char *)malloc(doc_buf_size);
     if (!doc_buf) { perror("malloc doc_buf"); exit(1); }
     /* 填充假文档内容 */
     memset(doc_buf, 'A' + (rand() % 26), doc_buf_size);
     /* 每个 doc 末尾加 \0 */
     for (int i = 0; i < num_docs; i++)
-        doc_buf[i * avg_doc_len + avg_doc_len - 1] = '\0';
+        doc_buf[(size_t)i * avg_doc_len + avg_doc_len - 1] = '\0';
 
     /* 生成倒排索引 */
     srand(42);
@@ -282,7 +282,7 @@ static int execute_query(int *query_terms, int num_query_terms, int num_docs,
     for (int k = 0; k < n_results; k++) {
         int did = result_buf[k].doc_id;
         /* 实际读文档内容 — 触发 doc_buf 的内存访问 */
-        volatile char c = doc_buf[did * avg_doc_len];
+        volatile char c = doc_buf[(size_t)did * avg_doc_len];
         (void)c;
         total_doc_reads++;
     }
