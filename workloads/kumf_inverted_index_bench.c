@@ -351,18 +351,21 @@ static void *query_worker(void *arg) {
     CPU_SET(qa->thread_to_cpu[qa->thread_id], &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 
-    /* 每个 thread 独立的 scores/seen buffer (避免 false sharing) */
-    double *scores = (double *)malloc(qa->num_docs * sizeof(double));
-    int *seen = (int *)malloc(qa->num_docs * sizeof(int));
-    scored_doc_t *result_buf = (scored_doc_t *)malloc(qa->top_k * 10 * sizeof(scored_doc_t));
-    if (!scores || !seen || !result_buf) {
-        fprintf(stderr, "Thread %d: malloc failed\n", qa->thread_id);
-        return NULL;
-    }
+    /*
+     * 紧凑评分结构 — 模拟真实搜索引擎 (Lucene/Elasticsearch)
+     *
+     * 真实搜索引擎不会给每条查询分配 num_docs 大小的 scores 数组。
+     * 而是只对命中文档评分，维护一个小型命中列表 + top-K 最小堆。
+     * 每条查询 scratch 约几十 KB，不是 120MB。
+     */
+
+    /* 命中文档: (doc_id, score) 对 — 每条查询通常命中几千个文档 */
+    int max_hits = 100000;  /* 每条查询最多 10 万命中文档 */
+    scored_doc_t *hits = (scored_doc_t *)malloc(max_hits * sizeof(scored_doc_t));
+    if (!hits) { fprintf(stderr, "Thread %d: malloc hits failed\n", qa->thread_id); return NULL; }
 
     long my_lookups = 0, my_scans = 0, my_reads = 0, my_queries = 0;
 
-    /* 每个 thread 处理一段查询 (round-robin 分配) */
     int queries_per_thread = qa->num_queries / qa->num_query_threads;
     int my_start = qa->thread_id * queries_per_thread;
     int my_end = (qa->thread_id == qa->num_query_threads - 1)
@@ -374,9 +377,9 @@ static void *query_worker(void *arg) {
     for (int round = 0; round < qa->num_rounds; round++) {
         for (int q = my_start; q < my_end; q++) {
             int *qt = &qa->all_query_terms[q * qa->terms_per_query];
-            memset(scores, 0, qa->num_docs * sizeof(double));
-            memset(seen, 0, qa->num_docs * sizeof(int));
+            int n_hits = 0;
 
+            /* Step 1+2: 词典查找 + 扫描 posting, 累积命中文档评分 */
             for (int t = 0; t < qa->terms_per_query; t++) {
                 dict_entry_t *entry = dict_lookup(qt[t]);
                 my_lookups++;
@@ -387,32 +390,34 @@ static void *query_worker(void *arg) {
                     posting_t *pe = &posting_buf[entry->posting_offset + p];
                     int did = pe->doc_id;
                     if (did < 0 || did >= qa->num_docs) continue;
-                    scores[did] += pe->tf * idf;
-                    seen[did] = 1;
+
+                    /* 在命中列表中查找: 线性搜索 (小列表, cache 友好) */
+                    int found = -1;
+                    for (int h = 0; h < n_hits; h++) {
+                        if (hits[h].doc_id == did) { found = h; break; }
+                    }
+                    if (found >= 0) {
+                        hits[found].score += pe->tf * idf;
+                    } else if (n_hits < max_hits) {
+                        hits[n_hits].doc_id = did;
+                        hits[n_hits].score = pe->tf * idf;
+                        n_hits++;
+                    }
                 }
                 my_scans += entry->posting_len;
             }
 
-            /* 取 top-K (选择排序) */
-            int n_res = 0;
-            for (int d = 0; d < qa->num_docs && n_res < qa->top_k * 10; d++) {
-                if (seen[d] && scores[d] > 0) {
-                    result_buf[n_res].doc_id = d;
-                    result_buf[n_res].score = scores[d];
-                    n_res++;
-                }
-            }
-            for (int i = 0; i < qa->top_k && i < n_res; i++) {
+            /* Step 3: 取 top-K (选择排序, 只排 top_k 个) */
+            for (int i = 0; i < qa->top_k && i < n_hits; i++) {
                 int mx = i;
-                for (int j = i + 1; j < n_res; j++)
-                    if (result_buf[j].score > result_buf[mx].score) mx = j;
-                if (mx != i) { scored_doc_t tmp = result_buf[i]; result_buf[i] = result_buf[mx]; result_buf[mx] = tmp; }
+                for (int j = i + 1; j < n_hits; j++)
+                    if (hits[j].score > hits[mx].score) mx = j;
+                if (mx != i) { scored_doc_t tmp = hits[i]; hits[i] = hits[mx]; hits[mx] = tmp; }
             }
-            if (n_res > qa->top_k) n_res = qa->top_k;
 
-            /* 读 top-K 文档原文 (冷) */
-            for (int k = 0; k < n_res; k++) {
-                int did = result_buf[k].doc_id;
+            /* Step 4: 读 top-K 文档原文 (冷!) */
+            for (int k = 0; k < qa->top_k && k < n_hits; k++) {
+                int did = hits[k].doc_id;
                 volatile const char *p = &doc_buf[(size_t)did * avg_doc_len];
                 (void)p[0]; (void)p[avg_doc_len/2]; (void)p[avg_doc_len-2];
                 my_reads++;
@@ -423,7 +428,6 @@ static void *query_worker(void *arg) {
 
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
 
-    /* 写回统计 */
     thread_stats[qa->thread_id].dict_lookups = my_lookups;
     thread_stats[qa->thread_id].posting_scans = my_scans;
     thread_stats[qa->thread_id].doc_reads = my_reads;
@@ -431,7 +435,7 @@ static void *query_worker(void *arg) {
     thread_stats[qa->thread_id].elapsed = (ts_end.tv_sec - ts_start.tv_sec)
                                          + (ts_end.tv_nsec - ts_start.tv_nsec) * 1e-9;
 
-    free(scores); free(seen); free(result_buf);
+    free(hits);
     return NULL;
 }
 
