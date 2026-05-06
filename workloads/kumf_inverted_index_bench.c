@@ -80,7 +80,7 @@ static pthread_mutex_t posting_lock = PTHREAD_MUTEX_INITIALIZER;
 static char *doc_buf = NULL;
 static size_t doc_buf_size = 0;
 static int avg_doc_len = 0;
-static int doc_read_stride = 64;  /* doc read 时每 stride 字节读一次, 模拟真实 snippet 提取 */
+static int doc_read_stride = 8;   /* doc read 时每 stride 字节读一次 (8=逐 long, 压延迟) */
 
 static size_t dict_bytes = 0;
 static size_t posting_bytes = 0;
@@ -281,7 +281,12 @@ static void *doc_build_worker(void *arg) {
 }
 
 static void build_index(int num_terms, int num_docs, int max_posting, int build_threads) {
-    dict_buckets = num_terms * 2 + 1;
+    /*
+     * Dict hash table 要远超 L3 cache (~32MB/socket on 鲲鹏930)
+     * num_terms * 4 buckets × 28B/entry → 500K terms = 56MB > L3
+     * 这样 dict 随机访问才会真正打到 DRAM, NUMA 延迟差才能体现
+     */
+    dict_buckets = num_terms * 4 + 1;
     dict_table = (dict_entry_t *)calloc(dict_buckets, sizeof(dict_entry_t));
     if (!dict_table) { perror("malloc dict"); exit(1); }
     for (int i = 0; i < dict_buckets; i++) dict_table[i].term_id = -1;
@@ -593,7 +598,7 @@ int main(int argc, char **argv) {
            query_threads);
 
     /* 估算内存 */
-    size_t est_dict = (size_t)(num_terms * 2 + 1) * sizeof(dict_entry_t) + num_terms * sizeof(dict_entry_t);
+    size_t est_dict = (size_t)(num_terms * 4 + 1) * sizeof(dict_entry_t) + num_terms * sizeof(dict_entry_t);
     /* 估算实际 posting 总量 (Zipf 分布) */
     long est_posting_count = 0;
     for (int t = 0; t < num_terms; t++) {
@@ -631,12 +636,13 @@ int main(int argc, char **argv) {
     int *all_query_terms = (int *)malloc(num_queries * terms_per_query * sizeof(int));
     unsigned int qseed = 42;
     for (int q = 0; q < num_queries * terms_per_query; q++) {
-        double u = (double)rand_r(&qseed) / RAND_MAX;
-        int tid = (int)(num_terms * pow(u, 3.0));
+        /* 均匀随机: 每个 term 被查询概率相同, 保证 dict 随机访问打到 DRAM
+         * Zipf 集中在热词 → 热词 entry 全在 L3 cache → 测不出 NUMA 延迟差 */
+        int tid = (int)((double)rand_r(&qseed) / RAND_MAX * num_terms);
         if (tid >= num_terms) tid = num_terms - 1;
         all_query_terms[q] = tid;
     }
-    printf("  %d queries (Zipf-like distribution)\n\n", num_queries);
+    printf("  %d queries (uniform random distribution)\n\n", num_queries);
 
     /* === Phase 3: 多线程并行查询 === */
     printf("── Phase 3: Query Benchmark (%d threads on Socket 0) ─────\n", query_threads);

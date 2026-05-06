@@ -36,6 +36,7 @@
 #include <sched.h>
 #include <numa.h>
 #include <numaif.h>
+#include <cerrno>
 
 /* ================================================================
  * Configuration
@@ -431,9 +432,9 @@ static void init_affinity(void) {
     /* Print node info */
     for (int i = 0; i < num_affinity_nodes; i++) {
         int n = affinity_nodes[i];
-        long long free_mem;
-        long long total_mem = numa_node_size(n, &free_mem);
-        KUMF_LOG("  Node %d: %lld MB total, %lld MB free",
+        long free_mem;
+        long total_mem = numa_node_size(n, &free_mem);
+        KUMF_LOG("  Node %d: %ld MB total, %ld MB free",
                  n, total_mem / (1024*1024), free_mem / (1024*1024));
     }
 }
