@@ -163,9 +163,9 @@ def cmd_diagnose(args):
     # 构建 perf record 命令
     spe_event = f"arm_spe/load_filter=1,store_filter=1,min_latency={args.min_lat}/"
     
-    # 使用 /tmp 作为 prof 输出目录
-    prof_tmp = f"/tmp/kumf_prof_{os.getpid()}"
-    os.makedirs(prof_tmp, exist_ok=True)
+    # PROF outputs to /tmp/kumf/ (hardcoded in ldlib.c)
+    # Ensure the directory exists
+    os.makedirs("/tmp/kumf", exist_ok=True)
     
     # 设置 LD_PRELOAD: prof.so 记录分配
     env = os.environ.copy()
@@ -202,10 +202,8 @@ def cmd_diagnose(args):
     spe_size_mb = spe_data.stat().st_size / 1024 / 1024
     print(f"   SPE data: {spe_size_mb:.1f} MB")
     
-    # 查找 prof 输出
-    prof_files = list(Path("/tmp/kumf").glob("data.raw.*"))
-    if not prof_files:
-        prof_files = list(Path(prof_tmp).glob("data.raw.*"))
+    # 查找 prof 输出 (PROF writes to /tmp/kumf/data.raw.TID, hardcoded in ldlib.c)
+    prof_files = sorted(Path("/tmp/kumf").glob("data.raw.*"))
     
     # 3. 解析 SPE → page PAC
     print()
@@ -243,8 +241,11 @@ def cmd_diagnose(args):
     
     if prof_files and pac_csv.exists():
         # 用 prof 交叉关联（最精确）
-        prof_file = prof_files[0]  # 取第一个（主线程）
-        print(f"   Prof data: {prof_file}")
+        # Merge all prof files (one per thread) for comprehensive cross-correlation
+        # pac_to_interc supports a single file, so we pass the first one;
+        # it contains allocations from the main thread which typically does bulk init
+        prof_file = prof_files[0]
+        print(f"   Prof data: {len(prof_files)} thread files, using {prof_file.name}")
         print(f"   PAC CSV: {pac_csv}")
         
         interc_cmd = [
@@ -312,14 +313,6 @@ def cmd_diagnose(args):
     print()
     print(f"  Run with:  kumf run --conf {conf_path} -- {' '.join([workload] + workload_args)}")
     print("=" * 54)
-    
-    # 清理 prof 临时文件
-    try:
-        import shutil
-        if os.path.exists(prof_tmp):
-            shutil.rmtree(prof_tmp, ignore_errors=True)
-    except:
-        pass
     
     return 0
 

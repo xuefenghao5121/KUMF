@@ -19,6 +19,7 @@
 #include <sys/syscall.h>
 #include <numa.h>
 #include <dlfcn.h>
+#include <signal.h>
 
 /* ---- State ---- */
 static int prof_initialized = 0;
@@ -499,4 +500,19 @@ void __attribute__((constructor)) m_init(void)
 
     /* Register cleanup via atexit (safer than destructor during glibc unwind) */
     atexit(prof_cleanup);
+
+    /* Also flush on SIGTERM/SIGINT — perf record may kill the workload,
+       and atexit won't fire on signal death. Re-raise after flushing. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = [](int sig) {
+        prof_cleanup();
+        /* Restore default and re-raise so the parent sees the signal */
+        signal(sig, SIG_DFL);
+        raise(sig);
+    };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND;  /* One-shot: avoid recursive signals */
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT, &sa, nullptr);
 }

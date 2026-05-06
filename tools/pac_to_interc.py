@@ -361,8 +361,8 @@ def main():
     parser.add_argument('--output', '-o', default='kumf.conf', help='Output interc config file')
     parser.add_argument('--fast-node', type=int, default=0, help='NUMA node for hot data')
     parser.add_argument('--slow-node', type=int, default=2, help='NUMA node for cold data')
-    parser.add_argument('--mode', choices=['page_range', 'size', 'alloc'], default='size',
-                        help='Config generation mode: page_range (需要 interc 支持), size (当前可用), alloc (需要 prof)')
+    parser.add_argument('--mode', choices=['alloc', 'size'], default='alloc',
+                        help='Config generation mode: alloc (caller-based, needs prof), size (fallback, no prof needed)')
     args = parser.parse_args()
     
     print(f"🦐 KUMF PAC → interc config generator")
@@ -379,13 +379,21 @@ def main():
         print(f"   Loaded {len(allocations)} prof allocations")
         alloc_pac = cross_correlate(pages, allocations)
         print(f"   Cross-correlated {len(alloc_pac)} allocations")
-        generate_interc_conf_alloc_based(alloc_pac, args.output, args.fast_node, args.slow_node)
+        if not alloc_pac:
+            print(f"⚠️  No cross-correlated allocations, falling back to size-based")
+            ranges = aggregate_page_ranges(pages)
+            print(f"   Aggregated into {len(ranges)} page ranges")
+            generate_interc_conf_size_based(ranges, args.output, args.fast_node, args.slow_node)
+        else:
+            generate_interc_conf_alloc_based(alloc_pac, args.output, args.fast_node, args.slow_node)
     
-    elif args.mode == 'page_range':
-        # page 地址范围路由
+    elif args.mode == 'alloc' and not args.prof_log:
+        # 没有 prof 数据，自动 fallback
+        print(f"   ⚠️  No prof data provided, falling back to size-based mode")
+        print(f"   (Provide --prof-log for more precise alloc-based rules)")
         ranges = aggregate_page_ranges(pages)
         print(f"   Aggregated into {len(ranges)} page ranges")
-        generate_interc_conf_page_ranges(ranges, args.output, args.fast_node, args.slow_node)
+        generate_interc_conf_size_based(ranges, args.output, args.fast_node, args.slow_node)
     
     else:
         # size-based 估算
