@@ -80,6 +80,7 @@ static pthread_mutex_t posting_lock = PTHREAD_MUTEX_INITIALIZER;
 static char *doc_buf = NULL;
 static size_t doc_buf_size = 0;
 static int avg_doc_len = 0;
+static int doc_read_stride = 64;  /* doc read 时每 stride 字节读一次, 模拟真实 snippet 提取 */
 
 static size_t dict_bytes = 0;
 static size_t posting_bytes = 0;
@@ -233,8 +234,8 @@ static void *build_worker(void *arg) {
     unsigned int seed = 42 + ba->thread_id;
 
     for (int t = start; t < end; t++) {
-        int df = 1 + (int)(ba->num_docs * 0.001 / (1.0 + t * 0.001));
-        if (df > ba->max_posting) df = ba->max_posting;
+        /* Zipf-like: 排名越靠前的 term, df 越大 */
+        int df = 1 + (int)(ba->max_posting / (1.0 + t * 0.01));
         if (df > ba->num_docs) df = ba->num_docs;
         pthread_mutex_lock(&posting_lock);
         if (posting_buf_used + df > posting_buf_cap)
@@ -415,11 +416,21 @@ static void *query_worker(void *arg) {
                 if (mx != i) { scored_doc_t tmp = hits[i]; hits[i] = hits[mx]; hits[mx] = tmp; }
             }
 
-            /* Step 4: 读 top-K 文档原文 (冷!) */
+            /* Step 4: 读 top-K 文档原文 (冷!)
+             *
+             * 模拟真实搜索引擎 snippet 提取: 遍历整篇文档,
+             * 每 doc_read_stride 字节读一个关键数据点。
+             * 不能只读 3 字节 — 那样 doc_buf 完全在 cache 里,
+             * 测不出 NUMA 延迟差。
+             */
             for (int k = 0; k < qa->top_k && k < n_hits; k++) {
                 int did = hits[k].doc_id;
-                volatile const char *p = &doc_buf[(size_t)did * avg_doc_len];
-                (void)p[0]; (void)p[avg_doc_len/2]; (void)p[avg_doc_len-2];
+                const char *doc = &doc_buf[(size_t)did * avg_doc_len];
+                long sum = 0;
+                for (int b = 0; b < avg_doc_len; b += doc_read_stride)
+                    sum += doc[b];
+                volatile long sink = sum;
+                (void)sink;
                 my_reads++;
             }
             my_queries++;
@@ -482,6 +493,7 @@ int main(int argc, char **argv) {
     int terms_per_query = 3;
     int top_k = 10;
     int num_rounds = 3;
+    int max_posting_param = 0;  /* 0 = auto (Zipf 分布, 峰值 5000) */
     int build_threads = 0;
     int query_threads = 0;  /* 0 = auto (Socket 0 的 CPU 数) */
 
@@ -493,8 +505,10 @@ int main(int argc, char **argv) {
         {"terms-per-q",  required_argument, 0, 't'},
         {"top-k",        required_argument, 0, 'k'},
         {"rounds",       required_argument, 0, 'r'},
+        {"max-posting",  required_argument, 0, 'm'},
         {"build-threads",required_argument, 0, 'b'},
         {"query-threads",required_argument, 0, 'j'},
+        {"doc-stride",   required_argument, 0, 's'},
         {"help",         no_argument,       0, 'h'},
         {0,0,0,0}
     };
@@ -509,8 +523,10 @@ int main(int argc, char **argv) {
         case 't': terms_per_query = atoi(optarg); break;
         case 'k': top_k = atoi(optarg); break;
         case 'r': num_rounds = atoi(optarg); break;
+        case 'm': max_posting_param = atoi(optarg); break;
         case 'b': build_threads = atoi(optarg); break;
         case 'j': query_threads = atoi(optarg); break;
+        case 's': doc_read_stride = atoi(optarg); break;
         case 'h':
             printf("Usage: %s [options]\n", argv[0]);
             printf("  -n  num-terms     (default 500000)\n");
@@ -520,6 +536,8 @@ int main(int argc, char **argv) {
             printf("  -t  terms-per-q   (default 3)\n");
             printf("  -k  top-k         (default 10)\n");
             printf("  -r  rounds        (default 3)\n");
+            printf("  -m  max-posting   (default: Zipf peak 5000)\n");
+            printf("  -s  doc-stride    (default 64)\n");
             printf("  -b  build-threads (default: auto=numa_nodes)\n");
             printf("  -j  query-threads (default: auto=socket0_cpus)\n");
             return 0;
@@ -528,7 +546,12 @@ int main(int argc, char **argv) {
     }
 
     avg_doc_len = avg_doc_len_param;
-    int max_posting = 20;
+    /*
+     * Posting list 长度分布: 真实搜索引擎遵循 Zipf 律 —
+     * 少数高频词 df 达数千, 大量低频词 df < 10。
+     * max_posting 控制峰值, df = max_posting / (1 + term_rank * 0.01)
+     */
+    int max_posting = max_posting_param > 0 ? max_posting_param : 5000;
 
     printf("================================================================\n");
     printf("  KUMF Inverted Index Benchmark (Multi-NUMA Realistic)\n");
