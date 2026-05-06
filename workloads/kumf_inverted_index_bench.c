@@ -46,7 +46,7 @@
 
 typedef struct dict_entry {
     int term_id;
-    int posting_offset;
+    long posting_offset;
     int posting_len;
     int df;
     struct dict_entry *next;
@@ -73,8 +73,8 @@ static int dict_pool_used = 0;
 static pthread_mutex_t dict_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static posting_t *posting_buf = NULL;
-static int posting_buf_cap = 0;
-static int posting_buf_used = 0;
+static long posting_buf_cap = 0;
+static long posting_buf_used = 0;
 static pthread_mutex_t posting_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static char *doc_buf = NULL;
@@ -182,7 +182,7 @@ static dict_entry_t *dict_lookup(int term_id) {
     return NULL;
 }
 
-static dict_entry_t *dict_insert(int term_id, int posting_offset, int posting_len, int df) {
+static dict_entry_t *dict_insert(int term_id, long posting_offset, int posting_len, int df) {
     uint32_t idx = hash_term(term_id, dict_buckets);
     pthread_mutex_lock(&dict_lock);
     dict_entry_t *e = &dict_table[idx];
@@ -240,7 +240,7 @@ static void *build_worker(void *arg) {
         pthread_mutex_lock(&posting_lock);
         if (posting_buf_used + df > posting_buf_cap)
             df = posting_buf_cap - posting_buf_used;
-        int offset = posting_buf_used;
+        long offset = posting_buf_used;
         posting_buf_used += df;
         pthread_mutex_unlock(&posting_lock);
         if (df <= 0) continue;
@@ -291,9 +291,20 @@ static void build_index(int num_terms, int num_docs, int max_posting, int build_
     dict_pool_used = 0;
     dict_bytes = dict_buckets * sizeof(dict_entry_t) + num_terms * sizeof(dict_entry_t);
 
-    posting_buf_cap = num_terms * max_posting;
+    posting_buf_cap = (long)num_terms * max_posting;  /* 峰值容量, 实际 Zipf 分布只用一小部分 */
+
+    /* 先计算 Zipf 分布下实际总 posting 数, 避免 malloc 过大 */
+    long actual_posting_count = 0;
+    for (int t = 0; t < num_terms; t++) {
+        int df = 1 + (int)(max_posting / (1.0 + t * 0.01));
+        if (df > num_docs) df = num_docs;
+        actual_posting_count += df;
+    }
+    posting_buf_cap = actual_posting_count + 1024;  /* 留一点余量 */
+
     posting_buf = (posting_t *)malloc((size_t)posting_buf_cap * sizeof(posting_t));
-    if (!posting_buf) { perror("malloc posting"); exit(1); }
+    if (!posting_buf) { fprintf(stderr, "malloc posting failed: need %ld entries (%.1f MB)\n",
+                                 posting_buf_cap, (double)posting_buf_cap * sizeof(posting_t) / 1024.0 / 1024.0); exit(1); }
     posting_buf_used = 0;
 
     doc_buf_size = (size_t)num_docs * avg_doc_len;
@@ -321,7 +332,7 @@ static void build_index(int num_terms, int num_docs, int max_posting, int build_
     for (int i = 0; i < n; i++) pthread_create(&tids[i], NULL, doc_build_worker, &dargs[i]);
     for (int i = 0; i < n; i++) pthread_join(tids[i], NULL);
 
-    posting_bytes = (size_t)posting_buf_cap * sizeof(posting_t);
+    posting_bytes = (size_t)posting_buf_used * sizeof(posting_t);  /* 实际使用量, 不是 cap */
     docstore_bytes = doc_buf_size;
     free(tids); free(bargs); free(dargs);
 }
@@ -583,7 +594,14 @@ int main(int argc, char **argv) {
 
     /* 估算内存 */
     size_t est_dict = (size_t)(num_terms * 2 + 1) * sizeof(dict_entry_t) + num_terms * sizeof(dict_entry_t);
-    size_t est_posting = (size_t)num_terms * max_posting * sizeof(posting_t);
+    /* 估算实际 posting 总量 (Zipf 分布) */
+    long est_posting_count = 0;
+    for (int t = 0; t < num_terms; t++) {
+        int df = 1 + (int)(max_posting / (1.0 + t * 0.01));
+        if (df > num_docs) df = num_docs;
+        est_posting_count += df;
+    }
+    size_t est_posting = (size_t)est_posting_count * sizeof(posting_t);
     size_t est_docs = (size_t)num_docs * avg_doc_len;
     printf("\n  Memory estimate:\n");
     printf("    Dictionary:     %8.1f MB  (HOT)\n", est_dict / 1024.0 / 1024.0);
@@ -603,9 +621,9 @@ int main(int argc, char **argv) {
     double t0 = now_sec();
     build_index(num_terms, num_docs, max_posting, build_threads);
     double t_build = now_sec() - t0;
-    printf("  Built in %.2fs: dict=%dKB posting=%dKB docs=%zuMB\n",
+    printf("  Built in %.2fs: dict=%.0fMB posting=%.0fMB docs=%zuMB\n",
            t_build,
-           (int)(dict_bytes/1024), (int)(posting_bytes/1024), docstore_bytes/1024/1024);
+           dict_bytes/1024.0/1024.0, posting_bytes/1024.0/1024.0, docstore_bytes/1024/1024);
     printf("  Data spread across %d NUMA nodes by first-touch\n\n", num_numa_nodes);
 
     /* === Phase 2: 生成查询 === */
