@@ -283,6 +283,16 @@ class KumfDaemon:
             env["KUMF_DAEMON"] = self.socket_path
             return json.dumps(env)
 
+        elif cmd == "LOOKUP":
+            # interc startup query: LOOKUP:pid:exe_path
+            exe_path = parts[1] if len(parts) > 1 else ""
+            exe_hash = hashlib.md5(exe_path.encode()).hexdigest()[:8]
+            lookup_path = self.state_dir / f"lookup_{exe_hash}.conf"
+            if lookup_path.exists():
+                nodes = ",".join(str(n["id"]) for n in self.topology.get("nodes", []))
+                return f"CONFIG:{nodes}:{lookup_path}"
+            return "NOCONFIG"
+
         elif cmd == "PING":
             return "PONG"
 
@@ -411,6 +421,7 @@ class KumfDaemon:
             return 1
 
         cmd_hash = hashlib.md5(json.dumps(cmd).encode()).hexdigest()[:8]
+        exe_path = os.path.abspath(cmd[0]) if cmd else None
         if not output_dir:
             output_dir = self.state_dir / f"profile_{cmd_hash}"
         output_dir = Path(output_dir)
@@ -500,12 +511,12 @@ class KumfDaemon:
 
                 subprocess.run(interc_cmd)
                 print(f"   Config: {conf_path}")
-                self._save_profile(cmd_hash, str(conf_path), baseline_time)
+                self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
             else:
                 print("   No PAC data generated")
                 conf_path = output_dir / "kumf.conf"
                 conf_path.write_text("# KUMF auto-config: affinity only\n")
-                self._save_profile(cmd_hash, str(conf_path), baseline_time)
+                self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
         else:
             print("   No SPE data captured")
 
@@ -515,14 +526,16 @@ class KumfDaemon:
         print(f"   Next run: kumf daemon wrap -- {' '.join(cmd)}")
         return 0
 
-    def _save_profile(self, cmd_hash, conf_path, baseline_time):
-        """Save profile to daemon state."""
+    def _save_profile(self, cmd_hash, conf_path, baseline_time, exe_path=None):
+        """Save profile to daemon state and register for transparent lookup."""
         profile = {
             "cmd_hash": cmd_hash,
             "conf_path": conf_path,
             "baseline_time": baseline_time,
             "profiled_at": datetime.now().isoformat(),
         }
+        if exe_path:
+            profile["exe_path"] = exe_path
         self.profiles[cmd_hash] = profile
 
         # Persist to disk
@@ -537,9 +550,20 @@ class KumfDaemon:
                 link_path.unlink()
             link_path.symlink_to(conf_path)
         except Exception:
-            # Fallback: copy the config
             import shutil
             shutil.copy2(conf_path, link_path)
+
+        # Register by exe_path for transparent LOOKUP queries
+        if exe_path:
+            exe_hash = hashlib.md5(exe_path.encode()).hexdigest()[:8]
+            lookup_path = self.state_dir / f"lookup_{exe_hash}.conf"
+            try:
+                if lookup_path.exists() or lookup_path.is_symlink():
+                    lookup_path.unlink()
+                lookup_path.symlink_to(conf_path)
+            except Exception:
+                import shutil
+                shutil.copy2(conf_path, lookup_path)
 
     def _is_running(self):
         """Check if daemon is running."""

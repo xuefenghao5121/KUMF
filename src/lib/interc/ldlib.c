@@ -54,6 +54,7 @@
 #include <numaif.h>
 #include <cerrno>
 #include <fcntl.h>
+#include <poll.h>
 
 /* ================================================================
  * Constants
@@ -73,6 +74,7 @@ enum kumf_mode {
     KUMF_MODE_BATCH = 0,       /* Single-socket: parent bind, children inherit */
     KUMF_MODE_PER_THREAD = 1,  /* Cross-socket: per-thread bind + mempolicy */
     KUMF_MODE_ROUTING = 2,     /* Config-driven: per-thread + allocation routing */
+    KUMF_MODE_PASSIVE = 3,      /* No daemon config -> zero overhead pass-through */
 };
 
 /* Memory policy enum */
@@ -438,6 +440,100 @@ static int get_next_node(void) {
 }
 
 /* ================================================================
+ * Daemon config query — transparent auto-detection
+ *
+ * When interc is system-wide preloaded (via .bashrc LD_PRELOAD),
+ * it queries the daemon on startup to check if the current binary
+ * has been registered (via "kumf daemon profile -- CMD").
+ *
+ * If registered → apply learned config (Mode 2/3)
+ * If not registered → PASSIVE mode (zero overhead pass-through)
+ * ================================================================ */
+
+#include <poll.h>
+
+static void query_daemon_for_config(void) {
+    /* Quick check: daemon socket exists? */
+    if (access(KUMF_SOCK_PATH, F_OK) < 0) {
+        KUMF_LOG("No daemon socket, passive mode");
+        kumf_mode_val = KUMF_MODE_PASSIVE;
+        return;
+    }
+
+    int sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (sock < 0) { kumf_mode_val = KUMF_MODE_PASSIVE; return; }
+
+    /* Get executable path */
+    char exe_path[256];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len < 0) { close(sock); kumf_mode_val = KUMF_MODE_PASSIVE; return; }
+    exe_path[len] = '\0';
+
+    /* Send LOOKUP to daemon */
+    char msg[512];
+    snprintf(msg, sizeof(msg), "LOOKUP:%d:%s", getpid(), exe_path);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, KUMF_SOCK_PATH, sizeof(addr.sun_path) - 1);
+
+    sendto(sock, msg, strlen(msg), MSG_DONTWAIT,
+           (struct sockaddr *)&addr, sizeof(addr));
+
+    /* Poll for response (50ms max) */
+    struct pollfd pfd;
+    pfd.fd = sock;
+    pfd.events = POLLIN;
+    int ret = poll(&pfd, 1, 50);
+
+    if (ret <= 0) {
+        close(sock);
+        KUMF_LOG("Daemon query timeout, passive mode");
+        kumf_mode_val = KUMF_MODE_PASSIVE;
+        return;
+    }
+
+    char buf[1024];
+    ssize_t n = recvfrom(sock, buf, sizeof(buf) - 1, 0, NULL, NULL);
+    close(sock);
+
+    if (n <= 0 || strncmp(buf, "NOCONFIG", 8) == 0) {
+        KUMF_LOG("No registered config for %s, passive mode", exe_path);
+        kumf_mode_val = KUMF_MODE_PASSIVE;
+        return;
+    }
+
+    buf[n] = '\0';
+
+    /* Parse CONFIG:nodes:path */
+    /* Format: "CONFIG:0,1,2,3:/var/lib/kumf/lookup_XXX.conf" */
+    const char *nodes_start = buf + 7;  /* skip "CONFIG:" */
+    const char *nodes_end = strchr(nodes_start, ':');
+    if (!nodes_end) { kumf_mode_val = KUMF_MODE_PASSIVE; return; }
+
+    /* Set KUMF_NODES from daemon */
+    char nodes_str[64];
+    size_t nl = nodes_end - nodes_start;
+    if (nl > 0 && nl < sizeof(nodes_str)) {
+        memcpy(nodes_str, nodes_start, nl);
+        nodes_str[nl] = '\0';
+        setenv("KUMF_NODES", nodes_str, 1);
+        KUMF_LOG("Daemon config: nodes=%s", nodes_str);
+    }
+
+    /* Set KUMF_CONF to the daemon-provided config path */
+    const char *conf_path = nodes_end + 1;
+    if (*conf_path && strlen(conf_path) > 0) {
+        setenv("KUMF_CONF", conf_path, 1);
+        KUMF_LOG("Daemon config: conf=%s", conf_path);
+    }
+
+    /* Now load_rules() and init_affinity() will use these env vars */
+    KUMF_LOG("Daemon config applied, proceeding with auto-mode selection");
+}
+
+/* ================================================================
  * pthread_create intercept (Mode 2/3 only)
  *
  * Mode 1 (batch): children inherit parent affinity, pass through.
@@ -471,8 +567,8 @@ extern "C" int pthread_create(pthread_t *tid, const pthread_attr_t *attr,
                                dlsym(RTLD_NEXT, "pthread_create");
     }
 
-    /* Mode 1 (batch): pass through, children inherit affinity */
-    if (kumf_mode_val == KUMF_MODE_BATCH) {
+    /* Passive or Batch mode: pass through to libc */
+    if (kumf_mode_val == KUMF_MODE_PASSIVE || kumf_mode_val == KUMF_MODE_BATCH) {
         return libc_pthread_create(tid, attr, start, arg);
     }
 
@@ -585,6 +681,9 @@ extern "C" void *malloc(size_t sz)
 {
     if (!libc_malloc) { libc_malloc = (void *(*)(size_t))dlsym(RTLD_NEXT, "malloc"); }
 
+    if (kumf_mode_val == KUMF_MODE_PASSIVE)
+        return libc_malloc(sz);
+
     if (layer2_active && sz > ROUTE_THRESHOLD) {
         load_rules();
         void *caller = __builtin_return_address(0);
@@ -604,6 +703,9 @@ extern "C" void *malloc(size_t sz)
 extern "C" void *calloc(size_t nmemb, size_t size)
 {
     if (!libc_calloc) { libc_calloc = (void *(*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc"); }
+
+    if (kumf_mode_val == KUMF_MODE_PASSIVE)
+        return libc_calloc(nmemb, size);
 
     size_t total = nmemb * size;
     if (layer2_active && total > ROUTE_THRESHOLD) {
@@ -625,6 +727,12 @@ extern "C" void *calloc(size_t nmemb, size_t size)
 extern "C" void *realloc(void *ptr, size_t size)
 {
     if (!libc_realloc) { libc_realloc = (void *(*)(void *, size_t))dlsym(RTLD_NEXT, "realloc"); }
+
+    if (kumf_mode_val == KUMF_MODE_PASSIVE) {
+        if (!ptr) return libc_malloc(size);
+        return libc_realloc(ptr, size);
+    }
+
     if (!ptr) return malloc(size);
     size_t old_sz = check_and_remove_seg((unsigned long)ptr);
     if (old_sz > 0) {
@@ -642,6 +750,11 @@ extern "C" void free(void *p)
 {
     if (!libc_free) { libc_free = (void (*)(void *))dlsym(RTLD_NEXT, "free"); }
     if (!p) return;
+
+    if (kumf_mode_val == KUMF_MODE_PASSIVE) {
+        libc_free(p);
+        return;
+    }
 
     /* Fast path: no routing ever used → skip hash lookup entirely */
     if (!routing_ever_used) {
@@ -774,6 +887,10 @@ static void init_affinity(void) {
                  mem_policy == KUMF_MPOL_BIND ? "bind" :
                  mem_policy == KUMF_MPOL_INTERLEAVE ? "interleave" : "preferred");
         break;
+
+    case KUMF_MODE_PASSIVE:
+        /* Should never reach here — passive mode exits early in constructor */
+        break;
     }
 
     /* Log topology summary */
@@ -808,6 +925,7 @@ static void init_affinity(void) {
 
 __attribute__((constructor))
 static void kumf_init(void) {
+    /* Always load libc pointers — needed for intercepts even in passive mode */
     libc_malloc = (void *(*)(size_t))dlsym(RTLD_NEXT, "malloc");
     libc_calloc = (void *(*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
     libc_realloc = (void *(*)(void *, size_t))dlsym(RTLD_NEXT, "realloc");
@@ -816,13 +934,27 @@ static void kumf_init(void) {
                                     void *(*)(void *), void *))
                            dlsym(RTLD_NEXT, "pthread_create");
 
+    /* Step 1: Query daemon for registered config
+     *   - If daemon has config for this binary → auto-apply (Mode 2/3)
+     *   - If no config → PASSIVE mode (zero overhead)
+     * Note: env vars (KUMF_NODES, KUMF_CONF, KUMF_AFFINITY) still override */
+    query_daemon_for_config();
+
+    /* Step 2: If passive, skip everything */
+    if (kumf_mode_val == KUMF_MODE_PASSIVE) {
+        KUMF_LOG("KUMF v2 loaded: PASSIVE (no config for this binary)");
+        return;
+    }
+
+    /* Step 3: Apply config */
     load_rules();
     init_affinity();
     connect_daemon();
 
     KUMF_LOG("KUMF v2 loaded: mode=%s, nodes=%d, routing=%s",
              kumf_mode_val == KUMF_MODE_BATCH ? "batch" :
-             kumf_mode_val == KUMF_MODE_PER_THREAD ? "per-thread" : "routing",
+             kumf_mode_val == KUMF_MODE_PER_THREAD ? "per-thread" :
+             kumf_mode_val == KUMF_MODE_ROUTING ? "routing" : "passive",
              num_affinity_nodes,
              layer2_active ? "on" : "off");
 }
