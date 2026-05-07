@@ -1,27 +1,36 @@
 /*
  * KUMF interc v2 — NUMA-aware thread affinity + optional allocation routing
  *
- * Two-layer design:
- *   Layer 1 (Basic, no KUMF_CONF):
- *     - Bind main thread to ALL CPUs in configured nodes (parent process)
- *     - Children inherit CPU affinity via clone/fork — NO per-thread work
- *     - NO set_mempolicy — first-touch naturally places pages on local node
- *     - NO malloc/calloc/realloc/free interception
- *     - Effect = exactly numactl --cpunodebind, via LD_PRELOAD
- *     - ZERO ongoing overhead (one-time sched_setaffinity at init)
+ * Three modes (auto-selected based on topology):
  *
- *   Layer 2 (Enhanced, KUMF_CONF has routing rules):
- *     - Per-thread binding + set_mempolicy for precise data placement
- *     - Intercepted pthread_create with round-robin/compact spread
- *     - Config-driven allocation routing on matched allocs
+ *   Mode 1 — Single-socket batch (nodes on same socket):
+ *     Bind main thread to ALL CPUs in configured nodes → children inherit.
+ *     NO set_mempolicy, NO pthread_create intercept, NO malloc intercept.
+ *     Same as numactl --cpunodebind, via LD_PRELOAD. Zero ongoing overhead.
+ *
+ *   Mode 2 — Cross-socket per-thread (nodes span multiple sockets):
+ *     Each thread bound to its own node + MPOL_PREFERRED(node).
+ *     Intercepted pthread_create with compact/round-robin spread.
+ *     Data placement follows thread binding via first-touch + mempolicy.
+ *     No malloc routing unless KUMF_CONF is set.
+ *
+ *   Mode 3 — Config-driven routing (KUMF_CONF has rules):
+ *     Per-thread binding (like Mode 2) + size/caller-based allocation routing.
+ *     Matched allocs → numa_alloc_onnode(). Unmatched → libc.
+ *
+ * Auto-detection:
+ *   If max NUMA distance between KUMF_NODES > 2× min distance → cross-socket
+ *   (same-socket distance ~12, cross-socket ~35-40 on Kunpeng930)
  *
  * Env vars:
- *   KUMF_CONF      - Config file path (triggers Layer 2 when set)
- *   KUMF_AFFINITY  - Thread affinity: auto|compact|off (default: auto)
- *                    Layer 1: auto = bind once; Layer 2: auto = round-robin
  *   KUMF_NODES     - Comma-separated node list (default: auto-detect all)
- *   KUMF_POLICY    - Memory policy (Layer 2 only): preferred|bind|interleave
- *   KUMF_DEBUG     - Enable debug logging (any value = on)
+ *   KUMF_AFFINITY  - auto|compact|batch|per-thread|off (default: auto)
+ *                    auto = topology-based decision
+ *                    batch = force Mode 1 (parent-level bind only)
+ *                    compact/per-thread = force Mode 2
+ *   KUMF_CONF      - Config file path (triggers Mode 3 routing)
+ *   KUMF_POLICY    - Memory policy (Mode 2/3): preferred|bind|interleave
+ *   KUMF_DEBUG     - Enable debug logging
  *   KUMF_DAEMON    - Socket path for daemon communication
  */
 #ifndef _GNU_SOURCE
@@ -59,14 +68,21 @@
 #define MAX_NUMA_NODES 128
 #define KUMF_SOCK_PATH "/tmp/kumf_daemon.sock"
 
-/* Memory policy enum (Layer 2 only) */
+/* Mode enum */
+enum kumf_mode {
+    KUMF_MODE_BATCH = 0,       /* Single-socket: parent bind, children inherit */
+    KUMF_MODE_PER_THREAD = 1,  /* Cross-socket: per-thread bind + mempolicy */
+    KUMF_MODE_ROUTING = 2,     /* Config-driven: per-thread + allocation routing */
+};
+
+/* Memory policy enum */
 enum kumf_mpolicy {
     KUMF_MPOL_PREFERRED = 0,
     KUMF_MPOL_BIND = 1,
     KUMF_MPOL_INTERLEAVE = 2,
 };
 
-/* Thread spread strategy (Layer 2 only) */
+/* Thread spread strategy */
 enum kumf_spread {
     KUMF_SPREAD_ROUNDROBIN = 0,
     KUMF_SPREAD_COMPACT = 1,
@@ -83,7 +99,7 @@ static int (*libc_pthread_create)(pthread_t *, const pthread_attr_t *,
                                    void *(*)(void *), void *);
 
 /* ================================================================
- * Address hash map for numa_alloc tracking (Layer 2 only)
+ * Address hash map (Mode 3 routing only)
  * ================================================================ */
 struct addr_entry {
     unsigned long addr;
@@ -123,7 +139,7 @@ static size_t check_and_remove_seg(unsigned long addr) {
 }
 
 /* ================================================================
- * Config rules (Layer 2 — from KUMF_CONF file)
+ * Config rules (Mode 3 — from KUMF_CONF file)
  * ================================================================ */
 struct addr_rule {
     unsigned long start;
@@ -149,7 +165,7 @@ static int num_name_rules = 0;
 static struct size_rule size_rules[MAX_NAME_RULES];
 static int num_size_rules = 0;
 static int rules_loaded = 0;
-static int layer2_active = 0;
+static int layer2_active = 0;  /* 1 = KUMF_CONF has routing rules */
 static pthread_mutex_t rules_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void load_rules(void) {
@@ -223,50 +239,35 @@ static void load_rules(void) {
 }
 
 /* ================================================================
- * Thread Affinity Management
- *
- * Layer 1 (no KUMF_CONF):
- *   - Set CPU affinity of MAIN thread to ALL CPUs in configured nodes
- *   - NO per-thread binding, NO set_mempolicy, NO pthread_create intercept
- *   - Children inherit parent affinity via clone/fork
- *   - Exactly = numactl --cpunodebind, via LD_PRELOAD
- *   - ZERO ongoing overhead
- *
- * Layer 2 (KUMF_CONF has rules):
- *   - Per-thread binding + set_mempolicy for precise data placement
- *   - Intercepted pthread_create with round-robin/compact spread
+ * Affinity State
  * ================================================================ */
-
-/* Affinity state */
-static int affinity_enabled = 0;
+static enum kumf_mode kumf_mode_val = KUMF_MODE_BATCH;
 static int affinity_nodes[MAX_NUMA_NODES];
 static int num_affinity_nodes = 0;
 static int next_node_rr = 0;
 static pthread_mutex_t affinity_rr_lock = PTHREAD_MUTEX_INITIALIZER;
-static enum kumf_spread spread_strategy = KUMF_SPREAD_ROUNDROBIN;
+static enum kumf_spread spread_strategy = KUMF_SPREAD_COMPACT; /* compact default */
 static enum kumf_mpolicy mem_policy = KUMF_MPOL_PREFERRED;
 
-/* Per-thread home node (TLS) — only used in Layer 2 mode */
+/* Per-thread home node (TLS) — Mode 2/3 */
 static __thread int thread_home_node = -1;
 
-/* Global thread counter for compact spread (Layer 2 only) */
+/* Global thread counter for compact spread — Mode 2/3 */
 static int global_thread_seq = 0;
 static pthread_mutex_t thread_seq_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Cached CPU counts per node (populated at init) */
+/* Cached CPU counts per node */
 static int node_cpu_counts[MAX_NUMA_NODES];
 static int node_cpu_counts_loaded = 0;
 
-/* Per-thread allocation statistics */
+/* Track if any thread ever used routing (to optimize free path) */
+static int routing_ever_used = 0;
+
+/* Per-thread stats */
 static __thread long long tl_stat_local = 0;
 static __thread long long tl_stat_config = 0;
-
-/* Aggregated stats (at destructor only) */
 static long long stat_local_allocs = 0;
 static long long stat_config_allocs = 0;
-
-/* Track if any thread ever used Layer 2 (to optimize free path) */
-static int layer2_ever_used = 0;
 
 static int kumf_debug = -1;
 
@@ -280,17 +281,19 @@ static int get_debug(void) {
     if (get_debug()) fprintf(stderr, "[KUMF] " fmt "\n", ##__VA_ARGS__); \
 } while(0)
 
+/* ================================================================
+ * Topology helpers
+ * ================================================================ */
+
 static int node_cpu_count(int node) {
     if (node_cpu_counts_loaded && node < MAX_NUMA_NODES)
         return node_cpu_counts[node];
-
     int count = 0;
     struct bitmask *cpus = numa_allocate_cpumask();
     if (!cpus) return 0;
     if (numa_node_to_cpus(node, cpus) == 0) {
         for (unsigned long i = 0; i < cpus->size && i < CPU_SETSIZE; i++) {
-            if (numa_bitmask_isbitset(cpus, i))
-                count++;
+            if (numa_bitmask_isbitset(cpus, i)) count++;
         }
     }
     numa_free_cpumask(cpus);
@@ -309,9 +312,34 @@ static void cache_node_cpu_counts(void) {
 }
 
 /*
- * L1 bind: set CPU affinity of current thread to ALL CPUs in all configured nodes.
- * This is exactly what numactl --cpunodebind does: bind once, children inherit.
- * NO set_mempolicy — first-touch naturally places pages on local node.
+ * Detect cross-socket topology by checking NUMA distance matrix.
+ * Returns 1 if any pair of affinity nodes has distance > 2× the minimum.
+ * (Kunpeng930: same-socket ~12, cross-socket ~35-40)
+ */
+static int is_cross_socket(void) {
+    if (num_affinity_nodes <= 1) return 0;
+
+    int min_dist = INT32_MAX, max_dist = 0;
+    for (int i = 0; i < num_affinity_nodes; i++) {
+        for (int j = i + 1; j < num_affinity_nodes; j++) {
+            int d = numa_distance(affinity_nodes[i], affinity_nodes[j]);
+            if (d > 0 && d < min_dist) min_dist = d;
+            if (d > max_dist) max_dist = d;
+        }
+    }
+
+    /* If max distance > 2× min, we have cross-socket access */
+    return (max_dist > min_dist * 2) ? 1 : 0;
+}
+
+/* ================================================================
+ * Binding functions
+ * ================================================================ */
+
+/*
+ * Mode 1 (batch): bind current thread to ALL CPUs in all configured nodes.
+ * Same as numactl --cpunodebind: one sched_setaffinity, children inherit.
+ * NO set_mempolicy — first-touch naturally local.
  */
 static int bind_to_all_nodes(void) {
     cpu_set_t cpuset;
@@ -333,19 +361,16 @@ static int bind_to_all_nodes(void) {
 }
 
 /*
- * L2 bind: bind current thread to a specific single NUMA node.
- * Used only when Layer 2 is active (KUMF_CONF has routing rules).
+ * Mode 2/3 (per-thread): bind current thread to a specific NUMA node.
+ * CPU affinity + set_mempolicy for precise data placement.
  */
 static int bind_thread_to_node(int node) {
     int ret;
-
-    /* 1. CPU affinity: restrict to this single node's CPUs */
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
 
     struct bitmask *cpus = numa_allocate_cpumask();
     if (!cpus) return -1;
-
     if (numa_node_to_cpus(node, cpus) < 0) {
         numa_free_cpumask(cpus);
         return -1;
@@ -363,9 +388,7 @@ static int bind_thread_to_node(int node) {
         return ret;
     }
 
-    /* 2. Memory policy: precise page placement control */
     unsigned long nodemask = (1UL << node);
-
     switch (mem_policy) {
     case KUMF_MPOL_PREFERRED:
         ret = set_mempolicy(MPOL_PREFERRED, &nodemask, sizeof(nodemask) * 8);
@@ -383,10 +406,9 @@ static int bind_thread_to_node(int node) {
     }
 
     if (ret < 0) {
-        KUMF_LOG("set_mempolicy(mpol=%d) to node %d failed: %s",
+        KUMF_LOG("set_mempolicy(mpol=%d) node %d failed: %s",
                  mem_policy, node, strerror(errno));
     }
-
     return 0;
 }
 
@@ -415,6 +437,13 @@ static int get_next_node(void) {
     }
 }
 
+/* ================================================================
+ * pthread_create intercept (Mode 2/3 only)
+ *
+ * Mode 1 (batch): children inherit parent affinity, pass through.
+ * Mode 2/3 (per-thread): each thread gets its own node assignment.
+ * ================================================================ */
+
 struct thread_wrap_args {
     void *(*start_routine)(void *);
     void *arg;
@@ -426,28 +455,14 @@ static void *thread_entry_wrapper(void *arg) {
     void *(*start)(void *) = w->start_routine;
     void *user_arg = w->arg;
     int node = w->assigned_node;
-
     libc_free(w);
 
     thread_home_node = node;
-
-    if (bind_thread_to_node(node) == 0) {
-        KUMF_LOG("Thread tid=%d bound to node %d (policy=%s)",
-                 (int)syscall(SYS_gettid), node,
-                 mem_policy == KUMF_MPOL_BIND ? "bind" :
-                 mem_policy == KUMF_MPOL_INTERLEAVE ? "interleave" : "preferred");
-    } else {
-        KUMF_LOG("Thread tid=%d FAILED to bind to node %d",
-                 (int)syscall(SYS_gettid), node);
-    }
-
+    bind_thread_to_node(node);
+    KUMF_LOG("Thread tid=%d -> node %d", (int)syscall(SYS_gettid), node);
     return start(user_arg);
 }
 
-/*
- * Intercept pthread_create for Layer 2 mode only.
- * Layer 1: threads inherit parent's CPU affinity naturally — no interception.
- */
 extern "C" int pthread_create(pthread_t *tid, const pthread_attr_t *attr,
                                void *(*start)(void *), void *arg) {
     if (!libc_pthread_create) {
@@ -456,18 +471,13 @@ extern "C" int pthread_create(pthread_t *tid, const pthread_attr_t *attr,
                                dlsym(RTLD_NEXT, "pthread_create");
     }
 
-    /* L1 (no config): inherit parent affinity, pass through */
-    if (!layer2_active) {
+    /* Mode 1 (batch): pass through, children inherit affinity */
+    if (kumf_mode_val == KUMF_MODE_BATCH) {
         return libc_pthread_create(tid, attr, start, arg);
     }
 
-    /* L2 (has config rules): per-thread NUMA assignment */
-    if (!affinity_enabled) {
-        return libc_pthread_create(tid, attr, start, arg);
-    }
-
+    /* Mode 2/3 (per-thread): assign node, wrap thread entry */
     int node = get_next_node();
-
     struct thread_wrap_args *w =
         (struct thread_wrap_args *)libc_malloc(sizeof(*w));
     if (!w) return ENOMEM;
@@ -485,10 +495,7 @@ static int daemon_sock = -1;
 
 static void connect_daemon(void) {
     const char *sock_path = getenv("KUMF_DAEMON");
-    /* Only connect if explicitly configured (KUMF_DAEMON env var set) */
     if (!sock_path) return;
-
-    /* Quick existence check: skip if socket file doesn't exist */
     if (access(sock_path, F_OK) < 0) return;
 
     daemon_sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
@@ -503,8 +510,6 @@ static void connect_daemon(void) {
     snprintf(msg, sizeof(msg), "REG:%d:%d", getpid(), num_affinity_nodes);
     sendto(daemon_sock, msg, strlen(msg), MSG_DONTWAIT,
            (struct sockaddr *)&addr, sizeof(addr));
-
-    KUMF_LOG("Registered with daemon at %s (pid=%d)", sock_path, getpid());
 }
 
 static void disconnect_daemon(void) {
@@ -523,10 +528,7 @@ static void disconnect_daemon(void) {
 }
 
 /* ================================================================
- * Node resolution: config rules only (Layer 2)
- *
- * Only called when Layer 2 is active AND size > ROUTE_THRESHOLD.
- * Layer 1 never enters this code path — malloc goes directly to libc.
+ * Node resolution (Mode 3 routing only)
  * ================================================================ */
 
 static int match_addr(void *caller) {
@@ -553,17 +555,17 @@ static int resolve_node(void *caller, size_t sz) {
 
     int node = match_size(sz);
     if (node >= 0) {
-        KUMF_LOG("L2 config(size): sz=%zu -> node %d", sz, node);
+        KUMF_LOG("routing(size): sz=%zu -> node %d", sz, node);
         tl_stat_config++;
-        layer2_ever_used = 1;
+        routing_ever_used = 1;
         return node;
     }
 
     node = match_addr(caller);
     if (node >= 0) {
-        KUMF_LOG("L2 config(addr): caller=%p sz=%zu -> node %d", caller, sz, node);
+        KUMF_LOG("routing(addr): caller=%p sz=%zu -> node %d", caller, sz, node);
         tl_stat_config++;
-        layer2_ever_used = 1;
+        routing_ever_used = 1;
         return node;
     }
 
@@ -574,15 +576,9 @@ static int resolve_node(void *caller, size_t sz) {
 /* ================================================================
  * LD_PRELOAD hooks: malloc/calloc/realloc/free
  *
- * Layer 1 (no KUMF_CONF):
- *   - All calls pass through to libc directly
- *   - Only overhead: one bool check (layer2_active) + branch
- *   - Locality from sched_setaffinity + first-touch, not interception
- *
- * Layer 2 (KUMF_CONF with rules):
- *   - Large allocs (>ROUTE_THRESHOLD) check rules
- *   - Matched → numa_alloc_onnode()
- *   - Unmatched → libc (first-touch)
+ * Mode 1 (batch): all calls pass through to libc. Overhead = one bool check.
+ * Mode 2 (per-thread): same as Mode 1 — no routing.
+ * Mode 3 (routing): large allocs check rules, matched → numa_alloc_onnode().
  * ================================================================ */
 
 extern "C" void *malloc(size_t sz)
@@ -596,11 +592,9 @@ extern "C" void *malloc(size_t sz)
         if (node >= 0) {
             void *addr = numa_alloc_onnode(sz, node);
             if (addr) {
-                KUMF_LOG("malloc(%zu) -> node %d addr=%p", sz, node, addr);
                 record_seg((unsigned long)addr, sz);
                 return addr;
             }
-            KUMF_LOG("malloc(%zu) node %d failed, fallback to libc", sz, node);
         }
     }
 
@@ -619,7 +613,6 @@ extern "C" void *calloc(size_t nmemb, size_t size)
         if (node >= 0) {
             void *addr = numa_alloc_onnode(total, node);
             if (addr) {
-                /* mmap returns zero-filled pages, no memset needed */
                 record_seg((unsigned long)addr, total);
                 return addr;
             }
@@ -650,8 +643,8 @@ extern "C" void free(void *p)
     if (!libc_free) { libc_free = (void (*)(void *))dlsym(RTLD_NEXT, "free"); }
     if (!p) return;
 
-    /* Fast path: Layer 1 only (no numa_alloc ever used) → skip hash lookup */
-    if (!layer2_ever_used) {
+    /* Fast path: no routing ever used → skip hash lookup entirely */
+    if (!routing_ever_used) {
         libc_free(p);
         return;
     }
@@ -673,30 +666,17 @@ void operator delete(void *ptr) noexcept { free(ptr); }
 void operator delete[](void *ptr) noexcept { free(ptr); }
 
 /* ================================================================
- * Initialization
+ * Initialization — auto-select mode based on topology
  * ================================================================ */
 
 static void init_affinity(void) {
-    const char *env = getenv("KUMF_AFFINITY");
-
-    if (!env || strcmp(env, "auto") == 0 || strcmp(env, "1") == 0 || strcmp(env, "on") == 0) {
-        affinity_enabled = 1;
-    } else if (strcmp(env, "compact") == 0) {
-        affinity_enabled = 1;
-        spread_strategy = KUMF_SPREAD_COMPACT;
-    } else if (strcmp(env, "off") == 0 || strcmp(env, "0") == 0) {
-        affinity_enabled = 0;
-        return;
-    } else {
-        affinity_enabled = 1;
-    }
-
     if (numa_available() < 0) {
-        KUMF_LOG("NUMA not available, affinity disabled");
-        affinity_enabled = 0;
+        KUMF_LOG("NUMA not available, disabled");
+        kumf_mode_val = KUMF_MODE_BATCH;
         return;
     }
 
+    /* Parse KUMF_NODES */
     const char *nodes_env = getenv("KUMF_NODES");
     if (nodes_env) {
         char *buf = strdup(nodes_env);
@@ -706,77 +686,100 @@ static void init_affinity(void) {
             if (numa_node_size(n, NULL) >= 0) {
                 affinity_nodes[num_affinity_nodes++] = n;
             } else {
-                KUMF_LOG("KUMF_NODES: node %d not available, skipping", n);
+                KUMF_LOG("KUMF_NODES: node %d not available", n);
             }
             tok = strtok(NULL, ",");
         }
         free(buf);
     } else {
+        /* Auto-detect: all available NUMA nodes */
         int max_node = numa_max_node();
         for (int i = 0; i <= max_node && num_affinity_nodes < MAX_NUMA_NODES; i++) {
-            if (numa_node_size(i, NULL) > 0) {
+            if (numa_node_size(i, NULL) > 0)
                 affinity_nodes[num_affinity_nodes++] = i;
-            }
         }
     }
 
     if (num_affinity_nodes == 0) {
-        KUMF_LOG("No NUMA nodes available, affinity disabled");
-        affinity_enabled = 0;
+        KUMF_LOG("No NUMA nodes, disabled");
+        kumf_mode_val = KUMF_MODE_BATCH;
         return;
     }
 
+    /* Parse KUMF_POLICY */
     const char *policy_env = getenv("KUMF_POLICY");
     if (policy_env) {
-        if (strcmp(policy_env, "bind") == 0) {
+        if (strcmp(policy_env, "bind") == 0)
             mem_policy = KUMF_MPOL_BIND;
-        } else if (strcmp(policy_env, "interleave") == 0) {
+        else if (strcmp(policy_env, "interleave") == 0)
             mem_policy = KUMF_MPOL_INTERLEAVE;
-        }
     }
 
-    if (layer2_active) {
-        /*
-         * Layer 2 mode (KUMF_CONF has rules): per-thread binding.
-         * Each thread gets its own node for precise data placement.
-         */
-        cache_node_cpu_counts();
+    /* Parse KUMF_AFFINITY: auto|compact|per-thread|batch|off */
+    const char *aff_env = getenv("KUMF_AFFINITY");
+    int force_mode = -1;  /* -1 = auto */
 
-        thread_home_node = affinity_nodes[0];
-        if (bind_thread_to_node(thread_home_node) == 0) {
-            KUMF_LOG("L2: Main thread bound to node %d (policy=%s, spread=%s)",
-                     thread_home_node,
-                     mem_policy == KUMF_MPOL_BIND ? "bind" :
-                     mem_policy == KUMF_MPOL_INTERLEAVE ? "interleave" : "preferred",
-                     spread_strategy == KUMF_SPREAD_COMPACT ? "compact" : "round-robin");
+    if (aff_env) {
+        if (strcmp(aff_env, "off") == 0 || strcmp(aff_env, "0") == 0) {
+            KUMF_LOG("Affinity explicitly disabled");
+            return;
+        } else if (strcmp(aff_env, "batch") == 0) {
+            force_mode = KUMF_MODE_BATCH;
+        } else if (strcmp(aff_env, "per-thread") == 0 || strcmp(aff_env, "compact") == 0) {
+            force_mode = KUMF_MODE_PER_THREAD;
+            if (strcmp(aff_env, "compact") == 0)
+                spread_strategy = KUMF_SPREAD_COMPACT;
         }
+        /* "auto" or unrecognized → auto-detect */
+    }
+
+    /* Auto-select mode based on topology */
+    if (force_mode >= 0) {
+        kumf_mode_val = (enum kumf_mode)force_mode;
+    } else if (layer2_active) {
+        /* KUMF_CONF with rules → Mode 3 */
+        kumf_mode_val = KUMF_MODE_ROUTING;
+    } else if (is_cross_socket()) {
+        /* Cross-socket → per-thread binding for data locality */
+        kumf_mode_val = KUMF_MODE_PER_THREAD;
     } else {
-        /*
-         * Layer 1 mode (default, no config): batch affinity only.
-         * Bind parent to ALL CPUs in configured nodes.
-         * Children inherit via clone/fork — NO per-thread work.
-         * NO set_mempolicy — first-touch handles data placement.
-         * This = exactly numactl --cpunodebind, via LD_PRELOAD.
-         */
-        if (bind_to_all_nodes() == 0) {
-            KUMF_LOG("L1: bound to %d nodes, children inherit, "
-                     "first-touch memory (zero overhead)",
-                     num_affinity_nodes);
-        } else {
-            KUMF_LOG("L1: bind_to_all_nodes failed: %s", strerror(errno));
-        }
-
-        /* Per-thread tracking disabled in L1 */
-        affinity_enabled = 0;
-
-        /* Close daemon socket in L1 mode (no daemon needed) */
-        if (daemon_sock >= 0) { close(daemon_sock); daemon_sock = -1; }
+        /* Single-socket → batch inherit (like numactl) */
+        kumf_mode_val = KUMF_MODE_BATCH;
     }
 
-    KUMF_LOG("Affinity: %d nodes [%s] mode=%s",
-             num_affinity_nodes,
+    /* Execute binding based on mode */
+    switch (kumf_mode_val) {
+    case KUMF_MODE_BATCH:
+        bind_to_all_nodes();
+        KUMF_LOG("Mode 1 (batch): %d nodes, parent bind, children inherit",
+                 num_affinity_nodes);
+        break;
+
+    case KUMF_MODE_PER_THREAD:
+        cache_node_cpu_counts();
+        thread_home_node = affinity_nodes[0];
+        bind_thread_to_node(thread_home_node);
+        KUMF_LOG("Mode 2 (per-thread): %d nodes, compact spread, policy=%s",
+                 num_affinity_nodes,
+                 mem_policy == KUMF_MPOL_BIND ? "bind" :
+                 mem_policy == KUMF_MPOL_INTERLEAVE ? "interleave" : "preferred");
+        break;
+
+    case KUMF_MODE_ROUTING:
+        cache_node_cpu_counts();
+        thread_home_node = affinity_nodes[0];
+        bind_thread_to_node(thread_home_node);
+        KUMF_LOG("Mode 3 (routing): %d nodes, %d size rules + %d addr rules, policy=%s",
+                 num_affinity_nodes, num_size_rules, num_addr_rules,
+                 mem_policy == KUMF_MPOL_BIND ? "bind" :
+                 mem_policy == KUMF_MPOL_INTERLEAVE ? "interleave" : "preferred");
+        break;
+    }
+
+    /* Log topology summary */
+    KUMF_LOG("Nodes: [%s], cross-socket: %s",
              nodes_env ? nodes_env : "auto",
-             layer2_active ? "L2(per-thread)" : "L1(batch inherit)");
+             is_cross_socket() ? "yes" : "no");
 
     for (int i = 0; i < num_affinity_nodes; i++) {
         int n = affinity_nodes[i];
@@ -785,6 +788,21 @@ static void init_affinity(void) {
         int cpus = node_cpu_count(n);
         KUMF_LOG("  Node %d: %d CPUs, %ld MB total, %ld MB free",
                  n, cpus, total_mem / (1024*1024), free_mem / (1024*1024));
+    }
+
+    /* Print distance matrix for cross-socket detection debug */
+    if (get_debug() && num_affinity_nodes > 1) {
+        KUMF_LOG("Distance matrix:");
+        for (int i = 0; i < num_affinity_nodes; i++) {
+            char line[256] = "";
+            for (int j = 0; j < num_affinity_nodes; j++) {
+                char cell[16];
+                snprintf(cell, sizeof(cell), "%4d",
+                         numa_distance(affinity_nodes[i], affinity_nodes[j]));
+                strcat(line, cell);
+            }
+            KUMF_LOG("  node %d: %s", affinity_nodes[i], line);
+        }
     }
 }
 
@@ -802,9 +820,11 @@ static void kumf_init(void) {
     init_affinity();
     connect_daemon();
 
-    KUMF_LOG("KUMF interc v2 loaded (L1=batch-inherit, L2=routing:%s, rules=%d)",
-             layer2_active ? "on" : "off",
-             num_size_rules + num_addr_rules);
+    KUMF_LOG("KUMF v2 loaded: mode=%s, nodes=%d, routing=%s",
+             kumf_mode_val == KUMF_MODE_BATCH ? "batch" :
+             kumf_mode_val == KUMF_MODE_PER_THREAD ? "per-thread" : "routing",
+             num_affinity_nodes,
+             layer2_active ? "on" : "off");
 }
 
 __attribute__((destructor))
@@ -815,7 +835,7 @@ static void kumf_fini(void) {
     stat_config_allocs += tl_stat_config;
 
     if (stat_local_allocs + stat_config_allocs > 0) {
-        KUMF_LOG("Stats: L1_local=%lld L2_config=%lld",
+        KUMF_LOG("Stats: local=%lld routed=%lld",
                  stat_local_allocs, stat_config_allocs);
     }
 }

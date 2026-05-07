@@ -101,11 +101,10 @@ def detect_numa_topology():
             sockets.append(socket_nodes)
         topology["sockets"] = sockets
 
-        # For stability: recommend using first socket only (like cpunodebind=0,1)
-        if sockets:
-            topology["recommended_nodes"] = sockets[0]
-            topology["recommended_policy"] = "preferred"
-            topology["recommended_spread"] = "compact"
+        # Use ALL nodes — interc auto-selects batch vs per-thread based on topology
+        topology["recommended_nodes"] = [n["id"] for n in topology["nodes"]]
+        topology["recommended_policy"] = "preferred"
+        topology["recommended_spread"] = "auto"  # let interc decide
 
     return topology
 
@@ -117,9 +116,9 @@ def get_optimal_config(topology):
         nodes = [n["id"] for n in topology.get("nodes", [])]
 
     return {
-        "KUMF_AFFINITY": topology.get("recommended_spread", "compact"),
         "KUMF_NODES": ",".join(str(n) for n in nodes),
-        "KUMF_POLICY": topology.get("recommended_policy", "preferred"),
+        # Don't set KUMF_AFFINITY — interc auto-selects batch vs per-thread
+        # Don't set KUMF_POLICY — preferred is the correct default for per-thread
     }
 
 
@@ -369,10 +368,10 @@ class KumfDaemon:
                     **self.optimal_config,
                 }
         else:
-            # Auto-detect locally (daemon not needed for basic mode)
+            # Auto-detect locally — just set LD_PRELOAD + KUMF_NODES
             env_overrides = {
                 "LD_PRELOAD": str(INTERC_SO),
-                **self.optimal_config,
+                "KUMF_NODES": ",".join(str(n["id"]) for n in self.topology["nodes"]),
             }
 
         # Execute wrapped command
@@ -426,9 +425,7 @@ class KumfDaemon:
         print("── Step 1/3: Baseline (affinity only) ──────────────")
         env = os.environ.copy()
         env["LD_PRELOAD"] = str(INTERC_SO)
-        env["KUMF_AFFINITY"] = "compact"
-        env["KUMF_NODES"] = ",".join(str(n) for n in self.optimal_config.get("KUMF_NODES", "").split(","))
-        env["KUMF_POLICY"] = "preferred"
+        env["KUMF_NODES"] = ",".join(str(n) for n in self.optimal_config.get("KUMF_NODES", "").split(",") if n)
 
         t0 = time.time()
         result = subprocess.run(cmd, env=env, capture_output=True, timeout=600)
