@@ -46,8 +46,8 @@ def _resolve_kumf_dirs():
     # Source tree: tools/kumf_daemon → build/ + tools/
     src_root = script_dir.parent
 
-    # Source tree detection: sibling 'build' directory exists
-    if (src_root / "build").is_dir():
+    # Source tree detection: has build/ AND KUMF source markers
+    if ((src_root / "build").is_dir() and (src_root / "src" / "lib" / "interc").is_dir()):
         return src_root / "build", src_root / "tools"
 
     # Installed layout: ~/.local/bin/ → ~/.local/lib/kumf/ + ~/.local/share/kumf/

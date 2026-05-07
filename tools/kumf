@@ -30,7 +30,7 @@ def _resolve_kumf_dirs():
         return Path(env_home) / "lib", Path(env_home) / "share"
     script_dir = Path(os.path.realpath(__file__)).parent
     src_root = script_dir.parent
-    if (src_root / "build").is_dir():
+    if (src_root / "build").is_dir() and (src_root / "src" / "lib" / "interc").is_dir():
         return src_root / "build", src_root / "tools"
     return src_root / "lib" / "kumf", src_root / "share" / "kumf"
 
