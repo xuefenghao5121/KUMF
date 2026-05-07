@@ -580,9 +580,15 @@ class KumfDaemon:
 
 BASH_INTEGRATION = '''
 # KUMF auto-optimization — add to ~/.bashrc
+# Starts daemon in background (zero-cost if already running)
 if command -v kumf &>/dev/null; then
-    # Auto-wrap commands with KUMF when daemon is running
     kumf daemon autostart 2>/dev/null
+
+    # Convenience function: wrap a single command with KUMF
+    # Usage: kumf_run ./my_workload [args...]
+    kumf_run() {
+        kumf daemon wrap -- "$@"
+    }
 fi
 '''
 
@@ -590,6 +596,11 @@ FISH_INTEGRATION = '''
 # KUMF auto-optimization — add to ~/.config/fish/config.fish
 if command -v kumf &>/dev/null
     kumf daemon autostart 2>/dev/null
+
+    # Convenience function
+    function kumf_run
+        kumf daemon wrap -- $argv
+    end
 end
 '''
 

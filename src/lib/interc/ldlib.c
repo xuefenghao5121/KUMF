@@ -255,10 +255,22 @@ static __thread int thread_id_seq = -1;  /* sequential ID for compact spread */
 static int global_thread_seq = 0;
 static pthread_mutex_t thread_seq_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Allocation statistics */
+/* Cached CPU counts per node (populated at init, avoids sysfs per-thread) */
+static int node_cpu_counts[MAX_NUMA_NODES];
+static int node_cpu_counts_loaded = 0;
+
+/* Per-thread allocation statistics (avoids cache-line bouncing on ARM) */
+static __thread long long tl_stat_local = 0;
+static __thread long long tl_stat_config = 0;
+static __thread long long tl_stat_default = 0;
+
+/* Aggregated stats (only touched at destructor, no contention) */
 static long long stat_local_allocs = 0;
 static long long stat_config_allocs = 0;
 static long long stat_default_allocs = 0;
+
+/* Track if any thread ever used Layer 2 (to optimize free path) */
+static int layer2_ever_used = 0;
 
 static int kumf_debug = -1;
 
@@ -274,8 +286,12 @@ static int get_debug(void) {
 
 /*
  * Get the number of CPUs in a NUMA node.
+ * Returns cached value if available, otherwise queries sysfs.
  */
 static int node_cpu_count(int node) {
+    if (node_cpu_counts_loaded && node < MAX_NUMA_NODES)
+        return node_cpu_counts[node];
+
     int count = 0;
     struct bitmask *cpus = numa_allocate_cpumask();
     if (!cpus) return 0;
@@ -287,6 +303,21 @@ static int node_cpu_count(int node) {
     }
     numa_free_cpumask(cpus);
     return count;
+}
+
+/*
+ * Cache CPU counts for all affinity nodes (called once at init).
+ * Avoids per-thread sysfs reads + malloc/free in get_next_node().
+ */
+static void cache_node_cpu_counts(void) {
+    if (node_cpu_counts_loaded) return;
+    memset(node_cpu_counts, 0, sizeof(node_cpu_counts));
+    for (int i = 0; i < num_affinity_nodes; i++) {
+        int n = affinity_nodes[i];
+        if (n < MAX_NUMA_NODES)
+            node_cpu_counts[n] = node_cpu_count(n);
+    }
+    node_cpu_counts_loaded = 1;
 }
 
 /*
@@ -364,12 +395,14 @@ static int get_next_node(void) {
         seq = global_thread_seq++;
         pthread_mutex_unlock(&thread_seq_lock);
 
-        /* Calculate cumulative CPU counts to find which node this thread belongs to */
+        /* Use cached CPU counts (no sysfs reads, no malloc/free) */
         int offset = 0;
         for (int i = 0; i < num_affinity_nodes; i++) {
-            int cpus = node_cpu_count(affinity_nodes[i]);
+            int n = affinity_nodes[i];
+            int cpus = (n < MAX_NUMA_NODES && node_cpu_counts_loaded)
+                       ? node_cpu_counts[n] : node_cpu_count(n);
             if (seq < offset + cpus) {
-                return affinity_nodes[i];
+                return n;
             }
             offset += cpus;
         }
@@ -535,7 +568,8 @@ static int resolve_node(void *caller, size_t sz) {
     int node = match_size(sz);
     if (node >= 0) {
         KUMF_LOG("L2 config(size): sz=%zu -> node %d", sz, node);
-        __sync_fetch_and_add(&stat_config_allocs, 1);
+        tl_stat_config++;
+        layer2_ever_used = 1;
         return node;
     }
 
@@ -543,12 +577,13 @@ static int resolve_node(void *caller, size_t sz) {
     node = match_addr(caller);
     if (node >= 0) {
         KUMF_LOG("L2 config(addr): caller=%p sz=%zu -> node %d", caller, sz, node);
-        __sync_fetch_and_add(&stat_config_allocs, 1);
+        tl_stat_config++;
+        layer2_ever_used = 1;
         return node;
     }
 
     /* No rule match → libc handles it (Layer 1 affinity ensures locality) */
-    __sync_fetch_and_add(&stat_local_allocs, 1);
+    tl_stat_local++;
     return -1;
 }
 
@@ -602,7 +637,7 @@ extern "C" void *calloc(size_t nmemb, size_t size)
         if (node >= 0) {
             void *addr = numa_alloc_onnode(total, node);
             if (addr) {
-                memset(addr, 0, total);
+                /* mmap returns zero-filled pages, no memset needed */
                 record_seg((unsigned long)addr, total);
                 return addr;
             }
@@ -632,6 +667,14 @@ extern "C" void free(void *p)
 {
     if (!libc_free) { libc_free = (void (*)(void *))dlsym(RTLD_NEXT, "free"); }
     if (!p) return;
+
+    /* Fast path: Layer 1 only (no numa_alloc ever used) → skip hash lookup */
+    if (!layer2_ever_used) {
+        libc_free(p);
+        return;
+    }
+
+    /* Layer 2 path: check if this was a numa_alloc'd segment */
     size_t sz = check_and_remove_seg((unsigned long)p);
     if (sz > 0) {
         numa_free(p, sz);
@@ -718,6 +761,9 @@ static void init_affinity(void) {
         }
     }
 
+    /* Cache CPU counts per node (avoids sysfs reads per thread) */
+    cache_node_cpu_counts();
+
     /* Bind main thread to first node */
     thread_home_node = affinity_nodes[0];
     if (bind_thread_to_node(thread_home_node) == 0) {
@@ -771,6 +817,11 @@ static void kumf_init(void) {
 __attribute__((destructor))
 static void kumf_fini(void) {
     disconnect_daemon();
+
+    /* Aggregate per-thread stats (no atomics needed, single-threaded at exit) */
+    stat_local_allocs += tl_stat_local;
+    stat_config_allocs += tl_stat_config;
+    stat_default_allocs += tl_stat_default;
 
     if (stat_local_allocs + stat_config_allocs + stat_default_allocs > 0) {
         KUMF_LOG("Stats: L1_local=%lld L2_config=%lld libc=%lld",
