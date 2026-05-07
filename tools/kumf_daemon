@@ -350,13 +350,19 @@ class KumfDaemon:
             print("KUMF daemon: not running")
             return 1
 
-        # Try to query daemon
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             sock.settimeout(2.0)
+            # MUST bind client addr for AF_UNIX DGRAM — otherwise daemon
+            # cannot send response back (recvfrom returns empty addr)
+            client_addr = f"/tmp/kumf_status_{os.getpid()}"
+            if os.path.exists(client_addr):
+                os.unlink(client_addr)
+            sock.bind(client_addr)
             sock.sendto(b"STATUS", self.socket_path)
             data, _ = sock.recvfrom(4096)
             sock.close()
+            os.unlink(client_addr)
 
             status = json.loads(data.decode())
             topo = status.get("topology", {})

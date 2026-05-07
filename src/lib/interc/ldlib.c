@@ -469,17 +469,33 @@ static void query_daemon_for_config(void) {
     if (len < 0) { close(sock); kumf_mode_val = KUMF_MODE_PASSIVE; return; }
     exe_path[len] = '\0';
 
+    /* Bind to temp address — AF_UNIX DGRAM requires explicit bind
+     * so the daemon has a return address to send the response to */
+    char client_path[64];
+    snprintf(client_path, sizeof(client_path), "/tmp/kumf_lookup_%d", getpid());
+    unlink(client_path);
+
+    struct sockaddr_un client_addr;
+    memset(&client_addr, 0, sizeof(client_addr));
+    client_addr.sun_family = AF_UNIX;
+    strncpy(client_addr.sun_path, client_path, sizeof(client_addr.sun_path) - 1);
+    if (bind(sock, (struct sockaddr *)&client_addr, sizeof(client_addr)) < 0) {
+        close(sock);
+        kumf_mode_val = KUMF_MODE_PASSIVE;
+        return;
+    }
+
     /* Send LOOKUP to daemon */
     char msg[512];
     snprintf(msg, sizeof(msg), "LOOKUP:%d:%s", getpid(), exe_path);
 
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, KUMF_SOCK_PATH, sizeof(addr.sun_path) - 1);
+    struct sockaddr_un daemon_addr;
+    memset(&daemon_addr, 0, sizeof(daemon_addr));
+    daemon_addr.sun_family = AF_UNIX;
+    strncpy(daemon_addr.sun_path, KUMF_SOCK_PATH, sizeof(daemon_addr.sun_path) - 1);
 
     sendto(sock, msg, strlen(msg), MSG_DONTWAIT,
-           (struct sockaddr *)&addr, sizeof(addr));
+           (struct sockaddr *)&daemon_addr, sizeof(daemon_addr));
 
     /* Poll for response (50ms max) */
     struct pollfd pfd;
@@ -489,6 +505,7 @@ static void query_daemon_for_config(void) {
 
     if (ret <= 0) {
         close(sock);
+        unlink(client_path);
         KUMF_LOG("Daemon query timeout, passive mode");
         kumf_mode_val = KUMF_MODE_PASSIVE;
         return;
@@ -497,6 +514,7 @@ static void query_daemon_for_config(void) {
     char buf[1024];
     ssize_t n = recvfrom(sock, buf, sizeof(buf) - 1, 0, NULL, NULL);
     close(sock);
+    unlink(client_path);
 
     if (n <= 0 || strncmp(buf, "NOCONFIG", 8) == 0) {
         KUMF_LOG("No registered config for %s, passive mode", exe_path);
