@@ -140,18 +140,31 @@ install: libs tools
 	@echo "   bin/:  kumf, kumf_daemon"
 	@echo "   lib/kumf/:  libkumf_interc.so, libkumf_prof.so, libkumf_mlock.so, spe_*"
 	@echo "   share/kumf/:  spe_page_pac.py, pac_to_interc.py, soar_*.py"
-	@echo ""
-	@echo "Add to ~/.bashrc for transparency:"
-	@echo "  export PATH=$(PREFIX)/bin:\$$PATH"
-	@echo "  export LD_PRELOAD=$(LIBDIR)/libkumf_interc.so"
+	@USER_HOME=$${SUDO_USER:+$$(eval echo ~$$SUDO_USER)}; \
+	USER_HOME=$${USER_HOME:-$$HOME}; \
+	if grep -q "KUMF auto-optimization" "$$USER_HOME/.bashrc" 2>/dev/null; then \
+		echo "   .bashrc: already configured"; \
+	else \
+		echo "" >> "$$USER_HOME/.bashrc"; \
+		echo "# >>> KUMF auto-optimization >>>" >> "$$USER_HOME/.bashrc"; \
+		echo "export PATH=$(PREFIX)/bin:\$$PATH" >> "$$USER_HOME/.bashrc"; \
+		echo "export LD_PRELOAD=$(LIBDIR)/libkumf_interc.so" >> "$$USER_HOME/.bashrc"; \
+		echo "# <<< KUMF auto-optimization <<<" >> "$$USER_HOME/.bashrc"; \
+		echo "   .bashrc: added KUMF config"; \
+	fi
 	@echo ""
 	@echo "Quick start:"
+	@echo "  source ~/.bashrc"
 	@echo "  kumf daemon start"
 	@echo "  kumf daemon profile -- ./your_workload"
 	@echo "  ./your_workload  # auto-optimized!"
 
 # Uninstall
 uninstall:
+	@USER_HOME=$${SUDO_USER:+$$(eval echo ~$$SUDO_USER)}; \
+	USER_HOME=$${USER_HOME:-$$HOME}; \
+	sed -i '/# >>> KUMF/,/# <<< KUMF/d' "$$USER_HOME/.bashrc" 2>/dev/null; \
+	echo "Removed from .bashrc"
 	rm -rf $(PREFIX)/bin/kumf $(PREFIX)/bin/kumf_daemon
 	rm -rf $(LIBDIR) $(SHAREDIR)
 	@echo "Uninstalled from $(PREFIX)/"
