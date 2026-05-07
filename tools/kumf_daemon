@@ -537,35 +537,42 @@ class KumfDaemon:
 
         # Step 3: Analyze SPE → generate config
         print("── Step 3/3: Analysis → Config ────────────────────")
-        if spe_data.exists() and spe_data.stat().st_size > 0:
-            print(f"   SPE data: {spe_data.stat().st_size / (1024*1024):.1f} MB")
-            pac_csv = output_dir / "page_pac.csv"
-            raw_file = output_dir / "spe_raw.txt"
+        if not spe_data.exists() or spe_data.stat().st_size == 0:
+            print("   ⚠️  No SPE data captured")
+            return 0
 
-            # Write perf report -D to temp file (avoids pipe buffer deadlock)
-            print("   Dumping SPE records...")
-            with open(raw_file, 'w') as f:
-                rc = subprocess.run(
-                    ["perf", "report", "-D", "-i", str(spe_data)],
-                    stdout=f, stderr=subprocess.PIPE, text=True
-                )
-                if rc.returncode != 0:
-                    print(f"   perf report failed: {rc.stderr[:200]}")
-            print(f"   Raw dump: {raw_file.stat().st_size / (1024*1024):.1f} MB")
+        print(f"   SPE data: {spe_data.stat().st_size / (1024*1024):.1f} MB")
+        pac_csv = output_dir / "page_pac.csv"
+        raw_file = output_dir / "spe_raw.txt"
 
-            # Feed raw dump to PAC analysis
-            print("   Analyzing with spe_page_pac.py...")
-            with open(raw_file, 'r') as f:
-                pac_result = subprocess.run(
-                    [sys.executable, str(SPE_PAGE_PAC), "-o", str(output_dir)],
-                    stdin=f, capture_output=True, text=True
-                )
-            if pac_result.returncode != 0:
-                print(f"   ❌ PAC analysis failed (rc={pac_result.returncode})")
-                if pac_result.stderr:
-                    print(f"   stderr: {pac_result.stderr[:500]}")
-            elif pac_result.stderr:
-                print(f"   PAC output: {pac_result.stderr[:300]}")
+        # Dump perf report -D to file (avoids pipe buffer deadlock)
+        print("   Dumping SPE records (perf report -D)...")
+        with open(raw_file, 'wb') as f:
+            rc = subprocess.run(
+                ["perf", "report", "-D", "-i", str(spe_data)],
+                stdout=f, stderr=subprocess.PIPE
+            )
+        if rc.returncode != 0:
+            stderr_text = rc.stderr.decode('utf-8', errors='replace') if rc.stderr else ''
+            print(f"   ❌ perf report failed (rc={rc.returncode}): {stderr_text[:200]}")
+            raw_file.unlink(missing_ok=True)
+            return 0
+        print(f"   Raw dump: {raw_file.stat().st_size / (1024*1024):.1f} MB")
+
+        # Feed raw dump to spe_page_pac.py
+        print(f"   Running spe_page_pac.py -o {output_dir}")
+        with open(raw_file, 'rb') as f:
+            pac_result = subprocess.run(
+                [sys.executable, str(SPE_PAGE_PAC), "-o", str(output_dir)],
+                stdin=f, capture_output=True
+            )
+        stderr_text = pac_result.stderr.decode('utf-8', errors='replace') if pac_result.stderr else ''
+        if pac_result.returncode != 0:
+            print(f"   ❌ spe_page_pac.py failed (rc={pac_result.returncode})")
+            if stderr_text:
+                print(f"   stderr: {stderr_text[:500]}")
+        elif stderr_text:
+            print(f"   PAC output: {stderr_text[:300]}")
 
             if pac_csv.exists() and pac_csv.stat().st_size > 0:
                 prof_files = sorted(Path("/tmp/kumf").glob("data.raw.*"))
@@ -575,7 +582,7 @@ class KumfDaemon:
                     interc_cmd = [
                         sys.executable, str(PAC_TO_INTERC),
                         "--pac-csv", str(pac_csv),
-                        "--prof-log", str(prof_files[-1]),  # latest file
+                        "--prof-log", str(prof_files[-1]),
                         "--mode", "alloc", "-o", str(conf_path),
                     ]
                 else:
@@ -585,17 +592,17 @@ class KumfDaemon:
                         "--mode", "size", "-o", str(conf_path),
                     ]
 
-                rc = subprocess.run(interc_cmd, capture_output=True, text=True)
+                print(f"   Running pac_to_interc.py...")
+                rc = subprocess.run(interc_cmd, capture_output=True)
                 if rc.returncode != 0:
-                    print(f"   ❌ pac_to_interc failed (rc={rc.returncode})")
-                    if rc.stderr:
-                        print(f"   stderr: {rc.stderr[:300]}")
+                    err = rc.stderr.decode('utf-8', errors='replace') if rc.stderr else ''
+                    print(f"   ❌ pac_to_interc failed (rc={rc.returncode}): {err[:300]}")
                 elif conf_path.exists():
                     nc = subprocess.run(["wc", "-l", str(conf_path)],
-                                       capture_output=True, text=True)
-                    print(f"   ✅ Config: {conf_path} ({nc.stdout.split()[0]} lines)")
+                                       capture_output=True)
+                    lines = nc.stdout.decode().split()[0]
+                    print(f"   ✅ Config: {conf_path} ({lines} lines)")
 
-                    # Show first few rules
                     with open(conf_path) as cf:
                         rules = [l.strip() for l in cf if l.strip() and not l.startswith('#')]
                     if rules:
@@ -603,7 +610,7 @@ class KumfDaemon:
                         for r in rules[:5]:
                             print(f"     {r}")
                     else:
-                        print("   ⚠️  Config has no rules (PAC found no actionable hot pages)")
+                        print("   ⚠️  Config has no rules — PAC found no actionable hot pages")
 
                     self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
                 else:
@@ -612,17 +619,20 @@ class KumfDaemon:
                     conf_path.write_text("# KUMF auto-config: pac_to_interc failed\n")
                     self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
             else:
-                print(f"   ⚠️  No PAC data generated (csv exists={pac_csv.exists()}, size={pac_csv.stat().st_size if pac_csv.exists() else 0})")
-                # Check if SPE data has any relevant records
+                print(f"   ⚠️  No PAC data (csv exists={pac_csv.exists()}, size={pac_csv.stat().st_size if pac_csv.exists() else 0})")
                 if raw_file.exists():
                     lcount = subprocess.run(["wc", "-l", str(raw_file)],
-                                           capture_output=True, text=True)
-                    print(f"   Raw dump lines: {lcount.stdout.split()[0]}")
+                                           capture_output=True)
+                    lines = lcount.stdout.decode().split()[0]
+                    print(f"   Raw dump: {lines} lines")
                 conf_path = output_dir / "kumf.conf"
-                conf_path.write_text("# KUMF auto-config: affinity only (no hot pages detected)\n# Try lower --min-lat (32) and lower --period (100)\n")
+                conf_path.write_text(
+                    "# KUMF auto-config: affinity only (PAC found no hot pages)\n"
+                    "# Tip: try --min-lat 32 to capture more L3-access data\n"
+                )
                 self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
         else:
-            print("   ⚠️  No SPE data captured (spe_data size=0 or missing)")
+            print("   ⚠️  No SPE data captured")
 
         print()
         print(f"✅ Profile saved for: {' '.join(cmd)}")
