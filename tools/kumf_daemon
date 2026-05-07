@@ -453,7 +453,7 @@ class KumfDaemon:
             return 1
 
         cmd_hash = hashlib.md5(json.dumps(cmd).encode()).hexdigest()[:8]
-        exe_path = os.path.abspath(cmd[0]) if cmd else None
+        exe_path = os.path.realpath(cmd[0]) if cmd else None  # resolve symlinks to match /proc/self/exe
         if not output_dir:
             output_dir = self.state_dir / f"profile_{cmd_hash}"
         output_dir = Path(output_dir)
