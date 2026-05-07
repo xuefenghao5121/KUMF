@@ -952,19 +952,24 @@ static void kumf_init(void) {
                                     void *(*)(void *), void *))
                            dlsym(RTLD_NEXT, "pthread_create");
 
-    /* Step 1: Query daemon for registered config
-     *   - If daemon has config for this binary → auto-apply (Mode 2/3)
-     *   - If no config → PASSIVE mode (zero overhead)
-     * Note: env vars (KUMF_NODES, KUMF_CONF, KUMF_AFFINITY) still override */
-    query_daemon_for_config();
+    /* Priority: explicit env vars > daemon auto-config > passive
+     * If user set KUMF_AFFINITY / KUMF_NODES / KUMF_CONF → use them directly.
+     * Otherwise, query daemon for a registered config.
+     * No config means PASSIVE (zero overhead for non-registered binaries). */
+    int explicit_env =
+        getenv("KUMF_AFFINITY") || getenv("KUMF_NODES") || getenv("KUMF_CONF");
 
-    /* Step 2: If passive, skip everything */
+    if (!explicit_env) {
+        query_daemon_for_config();
+    }
+
+    /* If passive (no config and no env vars), skip everything */
     if (kumf_mode_val == KUMF_MODE_PASSIVE) {
         KUMF_LOG("KUMF v2 loaded: PASSIVE (no config for this binary)");
         return;
     }
 
-    /* Step 3: Apply config */
+    /* Apply config (from env vars or daemon) */
     load_rules();
     init_affinity();
     connect_daemon();
