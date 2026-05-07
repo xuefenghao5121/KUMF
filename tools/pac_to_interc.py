@@ -318,40 +318,58 @@ def generate_interc_conf_size_based(ranges, output_path, fast_node=0, slow_node=
 
 
 def generate_interc_conf_alloc_based(alloc_pac, output_path, fast_node=0, slow_node=2):
-    """生成基于 prof 交叉关联的 interc 配置（最精确）"""
+    """Generate SIZE-based interc config from prof cross-correlation.
     
-    # 按 caller_sym 聚合
-    by_caller = defaultdict(lambda: {'sizes': [], 'total_pac': 0, 'count': 0, 'hot_count': 0})
+    Key insight: virtual addresses change every run (ASLR).
+    Size-based rules are stable — alloc sizes are deterministic.
+    Name-based rules are loaded by interc but not matched (no match_name impl).
+    """
+    
+    # Aggregate hot/cold by allocation size
+    hot_sizes = []
+    cold_sizes = []
     for a in alloc_pac:
-        key = a['caller_sym']
-        by_caller[key]['sizes'].append(a['size'])
-        by_caller[key]['total_pac'] += a['avg_pac']
-        by_caller[key]['count'] += 1
         if a['tier'] == 'HOT':
-            by_caller[key]['hot_count'] += 1
+            hot_sizes.append(a['size'])
+        elif a['tier'] == 'COLD':
+            cold_sizes.append(a['size'])
     
     with open(output_path, 'w') as f:
-        f.write(f"# KUMF interc configuration (prof cross-correlated)\n")
+        f.write(f"# KUMF interc configuration (size-based, cross-correlated from PAC + prof)\n")
         f.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"# Fast node: {fast_node} | Slow node: {slow_node}\n\n")
+        f.write(f"# Fast node: {fast_node} | Slow node: {slow_node}\n")
+        f.write(f"# Alloc rules: {len(alloc_pac)} prof allocations, {len(hot_sizes)} hot, {len(cold_sizes)} cold\n\n")
         
-        # 每个 caller 的典型大小和冷热判定
-        for caller, info in sorted(by_caller.items(), key=lambda x: -x[1]['total_pac']):
-            avg_pac = info['total_pac'] / info['count'] if info['count'] > 0 else 0
-            hot_ratio = info['hot_count'] / info['count'] if info['count'] > 0 else 0
-            tier = 'HOT' if hot_ratio > 0.7 else ('COLD' if hot_ratio < 0.3 else 'WARM')
-            node = fast_node if tier in ('HOT', 'WARM') else slow_node
-            typical_size = max(info['sizes'])
-            
-            f.write(f"# caller={caller} avg_PAC={avg_pac:.0f} tier={tier} ({info['count']} allocs, hot_ratio={hot_ratio:.1%})\n")
-            
-            # 如果有 caller_addr，用 addr_rule
-            if info.get('caller_addr') and info['caller_addr'] != 0:
-                ca = info['caller_addr']
-                f.write(f"0x{ca:x}-0x{ca:x} = {node}  # {caller} size~{typical_size/1024/1024:.0f}MB {tier}\n")
-            else:
-                # 用 name_rule
-                f.write(f"{caller} = {node}  # size~{typical_size/1024/1024:.0f}MB {tier}\n")
+        if hot_sizes:
+            # Hot allocations: route to fast node
+            # Use min/max range to cover typical hot alloc sizes
+            hot_min = min(hot_sizes)
+            hot_max = max(hot_sizes)
+            f.write(f"# HOT allocations ({len(hot_sizes)}): {hot_min/1024/1024:.0f}-{hot_max/1024/1024:.0f} MB\n")
+            f.write(f"size_range:{hot_min}-{hot_max} = {fast_node}  # HOT data -> fast node\n")
+        
+        if cold_sizes:
+            cold_min = min(cold_sizes)
+            cold_max = max(cold_sizes)
+            f.write(f"# COLD allocations ({len(cold_sizes)}): {cold_min/1024/1024:.0f}-{cold_max/1024/1024:.0f} MB\n")
+            f.write(f"size_range:{cold_min}-{cold_max} = {slow_node}  # COLD data -> slow node\n")
+        
+        if not hot_sizes and not cold_sizes:
+            f.write("# No actionable hot/cold allocations found\n")
+        
+        # Detail: per-caller summary
+        by_caller = defaultdict(lambda: {'sizes': [], 'avg_pac': 0, 'count': 0})
+        for a in alloc_pac:
+            key = a['caller_sym']
+            by_caller[key]['sizes'].append(a['size'])
+            by_caller[key]['avg_pac'] += a['avg_pac']
+            by_caller[key]['count'] += 1
+        
+        f.write(f"\n# Per-caller details:\n")
+        for caller, info in sorted(by_caller.items(), key=lambda x: -x[1]['avg_pac']):
+            avg = info['avg_pac'] / info['count'] if info['count'] else 0
+            sz = max(info['sizes']) if info['sizes'] else 0
+            f.write(f"#   {caller}: avg_PAC={avg:.0f} size~{sz/1024/1024:.0f}MB x{info['count']}\n")
 
 
 def main():
