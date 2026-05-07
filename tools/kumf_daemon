@@ -433,7 +433,7 @@ class KumfDaemon:
         except KeyboardInterrupt:
             return 130
 
-    def profile(self, cmd, min_lat=32, output_dir=None):
+    def profile(self, cmd, min_lat=32, period=0, user_only=False, output_dir=None):
         """Profile a workload and generate optimal config."""
         if not INTERC_SO.exists():
             print(f"Error: {INTERC_SO} not found (run: make libs)", file=sys.stderr)
@@ -475,27 +475,64 @@ class KumfDaemon:
         env_prof = os.environ.copy()
         env_prof["LD_PRELOAD"] = str(PROF_SO)
 
-        spe_event = f"arm_spe/load_filter=1,store_filter=1,min_latency={min_lat}/"
-        perf_cmd = [
-            "perf", "record", "-e", spe_event,
-            "-o", str(spe_data), "--"
-        ] + cmd
+        # Build SPE event with sampling parameters
+        spe_params = ["load_filter=1", "store_filter=1"]
+        spe_params.append(f"min_latency={min_lat}")
+        if period > 0:
+            spe_params.append(f"period={period}")
+
+        # Try user-only filter first, retry without if kernel doesn't support it
+        spe_event_templates = []
+        if user_only:
+            spe_event_templates.append(f"arm_spe/{','.join(spe_params + ['filter_el=1'])}/")
+        spe_event_templates.append(f"arm_spe/{','.join(spe_params)}/")
+
+        perf_cmd = ["perf", "record"]
+        spe_event = spe_event_templates[-1]  # fallback
 
         t0 = time.time()
-        try:
-            result = subprocess.run(perf_cmd, env=env_prof, timeout=600)
-            profile_time = time.time() - t0
-            print(f"   Profiled: {profile_time:.2f}s")
-        except Exception as e:
-            print(f"   Profiling failed: {e}")
-            print("   (SPE may not be available on this platform)")
+        spe_data_path = str(spe_data)
+        profiling_attempted = False
+
+        for template in spe_event_templates:
+            spe_event = template
+            perf_cmd = ["perf", "record", "-e", spe_event, "-o", spe_data_path, "--"] + cmd
+
+            try:
+                result = subprocess.run(perf_cmd, env=env_prof, timeout=600,
+                                       capture_output=True)
+                profiling_attempted = True
+                if result.returncode == 0 and spe_data.exists():
+                    break
+                elif result.returncode != 0 and template != spe_event_templates[-1]:
+                    # Kernel doesn't support this SPE config → try fallback
+                    print(f"   SPE {template} failed, trying fallback...")
+                    if spe_data.exists():
+                        spe_data.unlink()
+                    continue
+                else:
+                    break
+            except Exception as e:
+                profiling_attempted = True
+                if template != spe_event_templates[-1]:
+                    print(f"   SPE {template} failed ({e}), trying fallback...")
+                    if spe_data.exists():
+                        spe_data.unlink()
+                    continue
+                raise
+
+        profile_time = time.time() - t0
+
+        if not profiling_attempted or not spe_data.exists():
+            print(f"   Profiling failed — SPE may not be available on this platform")
             print()
             print("✅ Baseline config saved (affinity-only mode)")
-            # Save affinity-only config as the profile
             conf_path = output_dir / "kumf.conf"
             conf_path.write_text("# KUMF auto-config: affinity only (no SPE data)\n")
-            self._save_profile(cmd_hash, str(conf_path), baseline_time)
+            self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
             return 0
+
+        print(f"   Profiled: {profile_time:.2f}s (event={spe_event})")
         print()
 
         # Step 3: Analyze SPE → generate config
@@ -686,7 +723,9 @@ def main():
 
     # profile
     p_prof = sub.add_parser("profile", help="Profile workload and generate config")
-    p_prof.add_argument("--min-lat", type=int, default=32, help="SPE min latency filter")
+    p_prof.add_argument("--min-lat", type=int, default=32, help="SPE min latency filter (cycles, default 32)")
+    p_prof.add_argument("--period", type=int, default=0, help="SPE sampling period (default: every event, 1000=1/1000th)")
+    p_prof.add_argument("--user-only", action="store_true", help="Only sample user-space (EL0), ignore kernel")
     p_prof.add_argument("-o", "--output", default=None, help="Output directory")
     p_prof.add_argument("command", nargs=argparse.REMAINDER, help="Command to profile")
 
@@ -724,7 +763,8 @@ def main():
         if not cmd:
             print("Error: no command specified", file=sys.stderr)
             return 1
-        return daemon.profile(cmd, min_lat=args.min_lat, output_dir=args.output)
+        return daemon.profile(cmd, min_lat=args.min_lat, period=args.period,
+                             user_only=args.user_only, output_dir=args.output)
     elif args.daemon_cmd == "config":
         topology = detect_numa_topology()
         config = get_optimal_config(topology)
