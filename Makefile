@@ -116,19 +116,38 @@ $(BUILD_DIR)/spe_preload.so: src/tools/spe_preload.c src/tools/spe_self_profile.
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-# Install kumf CLI + daemon
+# Install everything: CLI, daemon, .so libs, Python tools
 PREFIX ?= $(HOME)/.local
+LIBDIR  ?= $(PREFIX)/lib/kumf
+SHAREDIR ?= $(PREFIX)/share/kumf
 
-install: tools
-	install -d $(PREFIX)/bin
+install: libs tools
+	install -d $(PREFIX)/bin $(LIBDIR) $(SHAREDIR)
 	install -m 755 tools/kumf $(PREFIX)/bin/kumf
 	install -m 755 tools/kumf_daemon $(PREFIX)/bin/kumf_daemon
-	@echo "✅ Installed: $(PREFIX)/bin/kumf, $(PREFIX)/bin/kumf_daemon"
-	@echo "   Add to PATH: export PATH=$(PREFIX)/bin:\$$PATH"
+	install -m 755 $(BUILD_DIR)/libkumf_interc.so $(LIBDIR)/
+	install -m 755 $(BUILD_DIR)/libkumf_prof.so $(LIBDIR)/
+	install -m 755 $(BUILD_DIR)/libkumf_mlock.so $(LIBDIR)/
+	install -m 755 $(BUILD_DIR)/spe_self_profile $(LIBDIR)/
+	install -m 755 $(BUILD_DIR)/spe_preload.so $(LIBDIR)/
+	install -m 644 tools/spe_page_pac.py $(SHAREDIR)/
+	install -m 644 tools/pac_to_interc.py $(SHAREDIR)/
+	install -m 644 tools/soar_analyzer.py $(SHAREDIR)/
+	install -m 644 tools/soar_pipeline.py $(SHAREDIR)/
+	install -m 644 tools/soar_spe_report.py $(SHAREDIR)/
+	@echo "✅ Installed to $(PREFIX)/"
+	@echo "   bin/:  kumf, kumf_daemon"
+	@echo "   lib/kumf/:  libkumf_interc.so, libkumf_prof.so, libkumf_mlock.so, spe_*"
+	@echo "   share/kumf/:  spe_page_pac.py, pac_to_interc.py, soar_*.py"
+	@echo ""
+	@echo "Add to ~/.bashrc for transparency:"
+	@echo "  export PATH=$(PREFIX)/bin:\$$PATH"
+	@echo "  export LD_PRELOAD=$(LIBDIR)/libkumf_interc.so"
 	@echo ""
 	@echo "Quick start:"
 	@echo "  kumf daemon start"
-	@echo "  kumf daemon wrap -- ./your_workload"
+	@echo "  kumf daemon profile -- ./your_workload"
+	@echo "  ./your_workload  # auto-optimized!"
 
 clean:
 	rm -rf $(BUILD_DIR)

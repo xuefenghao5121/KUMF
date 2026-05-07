@@ -30,16 +30,39 @@ import hashlib
 from pathlib import Path
 from datetime import datetime
 
-# Paths
-KUMF_ROOT = Path(__file__).resolve().parent.parent
-BUILD_DIR = KUMF_ROOT / "build"
-INTERC_SO = BUILD_DIR / "libkumf_interc.so"
-PROF_SO = BUILD_DIR / "libkumf_prof.so"
+# ─── Path resolution: source tree vs installed ───
+# Source tree layout:  KUMF_ROOT/build/  KUMF_ROOT/tools/
+# Installed layout:    $PREFIX/lib/kumf/ $PREFIX/share/kumf/
+# $PREFIX defaults to ~/.local, scripts in $PREFIX/bin/
+
+def _resolve_kumf_dirs():
+    """Find KUMF lib/share dirs — supports source tree and installed layouts."""
+    env_home = os.environ.get("KUMF_HOME")
+    if env_home:
+        return Path(env_home) / "lib", Path(env_home) / "share"
+
+    script_dir = Path(os.path.realpath(__file__)).parent
+    # For venv-style: bin/kumf_daemon → lib/kumf/ + share/kumf/
+    # Source tree: tools/kumf_daemon → build/ + tools/
+    src_root = script_dir.parent
+
+    # Source tree detection: sibling 'build' directory exists
+    if (src_root / "build").is_dir():
+        return src_root / "build", src_root / "tools"
+
+    # Installed layout: ~/.local/bin/ → ~/.local/lib/kumf/ + ~/.local/share/kumf/
+    return src_root / "lib" / "kumf", src_root / "share" / "kumf"
+
+_LIB_DIR, _SHARE_DIR = _resolve_kumf_dirs()
+
+INTERC_SO = _LIB_DIR / "libkumf_interc.so"
+PROF_SO = _LIB_DIR / "libkumf_prof.so"
+MLOCK_SO = _LIB_DIR / "libkumf_mlock.so"
 DEFAULT_SOCK = "/tmp/kumf_daemon.sock"
 DEFAULT_PID_FILE = "/tmp/kumf_daemon.pid"
 DEFAULT_STATE_DIR = Path("/tmp/kumf_daemon")
-SPE_PAGE_PAC = KUMF_ROOT / "tools" / "spe_page_pac.py"
-PAC_TO_INTERC = KUMF_ROOT / "tools" / "pac_to_interc.py"
+SPE_PAGE_PAC = _SHARE_DIR / "spe_page_pac.py"
+PAC_TO_INTERC = _SHARE_DIR / "pac_to_interc.py"
 
 
 # ============================================================

@@ -23,8 +23,20 @@ import subprocess
 import argparse
 from pathlib import Path
 
+# ─── Path resolution: source tree vs installed ───
+def _resolve_kumf_dirs():
+    env_home = os.environ.get("KUMF_HOME")
+    if env_home:
+        return Path(env_home) / "lib", Path(env_home) / "share"
+    script_dir = Path(os.path.realpath(__file__)).parent
+    src_root = script_dir.parent
+    if (src_root / "build").is_dir():
+        return src_root / "build", src_root / "tools"
+    return src_root / "lib" / "kumf", src_root / "share" / "kumf"
+
 KUMF_ROOT = Path(__file__).resolve().parent.parent
 TOOLS_DIR = Path(__file__).resolve().parent
+_LIB_DIR, _SHARE_DIR = _resolve_kumf_dirs()
 
 
 def main():
@@ -122,8 +134,8 @@ def cmd_diagnose(args):
 
     SPE_PAGE_PAC = TOOLS_DIR / "spe_page_pac.py"
     PAC_TO_INTERC = TOOLS_DIR / "pac_to_interc.py"
-    INTERC_SO = KUMF_ROOT / "build" / "libkumf_interc.so"
-    PROF_SO = KUMF_ROOT / "build" / "libkumf_prof.so"
+    INTERC_SO = _LIB_DIR / "libkumf_interc.so"
+    PROF_SO = _LIB_DIR / "libkumf_prof.so"
 
     print("╔══════════════════════════════════════════════════╗")
     print("║       KUMF Tiered Memory Diagnosis               ║")
@@ -276,7 +288,7 @@ def cmd_diagnose(args):
 
 def cmd_run(args):
     """用 interc 配置运行 workload"""
-    INTERC_SO = KUMF_ROOT / "build" / "libkumf_interc.so"
+    INTERC_SO = _LIB_DIR / "libkumf_interc.so"
 
     if not INTERC_SO.exists():
         print(f"Error: {INTERC_SO} not found (run: make libs)", file=sys.stderr)
@@ -356,7 +368,7 @@ def cmd_bench(args):
     import json
     from datetime import datetime
 
-    INTERC_SO = KUMF_ROOT / "build" / "libkumf_interc.so"
+    INTERC_SO = _LIB_DIR / "libkumf_interc.so"
     workload = args.workload
     workload_args = args.workload_args
     runs = args.runs
