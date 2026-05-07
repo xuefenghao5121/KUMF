@@ -38,7 +38,8 @@ help:
 	@echo "  make libs     - Build LD_PRELOAD libraries (interc, prof, mlock)"
 	@echo "  make workloads - Build test workloads"
 	@echo "  make tools    - Build SPE profiling tools"
-	@echo "  make install  - Install kumf CLI to ~/.local/bin"
+	@echo "  make install  - Install to /usr/local (override: PREFIX=/opt/kumf)"
+	@echo "  make uninstall - Remove installed files from PREFIX"
 	@echo "  make clean    - Remove build artifacts"
 	@echo ""
 	@echo "Variables:"
@@ -117,7 +118,7 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 # Install everything: CLI, daemon, .so libs, Python tools
-PREFIX ?= $(HOME)/.local
+PREFIX ?= /usr/local
 LIBDIR  ?= $(PREFIX)/lib/kumf
 SHAREDIR ?= $(PREFIX)/share/kumf
 
@@ -148,6 +149,12 @@ install: libs tools
 	@echo "  kumf daemon start"
 	@echo "  kumf daemon profile -- ./your_workload"
 	@echo "  ./your_workload  # auto-optimized!"
+
+# Uninstall
+uninstall:
+	rm -rf $(PREFIX)/bin/kumf $(PREFIX)/bin/kumf_daemon
+	rm -rf $(LIBDIR) $(SHAREDIR)
+	@echo "Uninstalled from $(PREFIX)/"
 
 clean:
 	rm -rf $(BUILD_DIR)
