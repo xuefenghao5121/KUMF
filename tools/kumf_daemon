@@ -31,27 +31,30 @@ from pathlib import Path
 from datetime import datetime
 
 # ─── Path resolution: source tree vs installed ───
-# Source tree layout:  KUMF_ROOT/build/  KUMF_ROOT/tools/
-# Installed layout:    $PREFIX/lib/kumf/ $PREFIX/share/kumf/
-# $PREFIX defaults to ~/.local, scripts in $PREFIX/bin/
+# Source tree:  KUMF/tools/kumf_daemon → KUMF/build/ (libs) + KUMF/tools/ (scripts)
+# Installed:    /usr/local/lib/kumf/kumf_daemon → same dir for everything
+# Bin symlinks: /usr/local/bin/kumf → ../lib/kumf/kumf (resolved by realpath)
 
 def _resolve_kumf_dirs():
-    """Find KUMF lib/share dirs — supports source tree and installed layouts."""
+    """Find KUMF library and script directories.
+    
+    Symlink-safe: uses os.path.realpath() to resolve bin symlinks
+    to the actual install directory.
+    """
     env_home = os.environ.get("KUMF_HOME")
     if env_home:
-        return Path(env_home) / "lib", Path(env_home) / "share"
+        return Path(env_home), Path(env_home)
 
-    script_dir = Path(os.path.realpath(__file__)).parent
-    # For venv-style: bin/kumf_daemon → lib/kumf/ + share/kumf/
-    # Source tree: tools/kumf_daemon → build/ + tools/
-    src_root = script_dir.parent
+    # Real path resolves symlinks — e.g. /usr/local/bin/kumf_daemon → .../lib/kumf/kumf_daemon
+    kdir = Path(os.path.realpath(__file__)).parent
 
-    # Source tree detection: has build/ AND KUMF source markers
-    if ((src_root / "build").is_dir() and (src_root / "src" / "lib" / "interc").is_dir()):
-        return src_root / "build", src_root / "tools"
+    # Source tree detection: kdir = KUMF/tools/, parent/build/ = KUMF/build/
+    # (NOT parent.parent, so /usr/local/build/ cannot interfere)
+    if (kdir.parent / "build").is_dir():
+        return kdir.parent / "build", kdir
 
-    # Installed layout: ~/.local/bin/ → ~/.local/lib/kumf/ + ~/.local/share/kumf/
-    return src_root / "lib" / "kumf", src_root / "share" / "kumf"
+    # Installed: everything in one directory
+    return kdir, kdir
 
 _LIB_DIR, _SHARE_DIR = _resolve_kumf_dirs()
 

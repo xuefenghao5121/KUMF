@@ -38,7 +38,7 @@ help:
 	@echo "  make libs     - Build LD_PRELOAD libraries (interc, prof, mlock)"
 	@echo "  make workloads - Build test workloads"
 	@echo "  make tools    - Build SPE profiling tools"
-	@echo "  make install  - Install to /usr/local (override: PREFIX=/opt/kumf)"
+	@echo "  make install  - Install to /usr/local/lib/kumf/ (symlinks in /usr/local/bin/)"
 	@echo "  make uninstall - Remove installed files from PREFIX"
 	@echo "  make clean    - Remove build artifacts"
 	@echo ""
@@ -118,40 +118,34 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 # Install everything: CLI, daemon, .so libs, Python tools
+# Flat layout under /usr/local/lib/kumf/, symlinks in /usr/local/bin/
 PREFIX ?= /usr/local
-LIBDIR  ?= $(PREFIX)/lib/kumf
-SHAREDIR ?= $(PREFIX)/share/kumf
+KUMF_HOME ?= $(PREFIX)/lib/kumf
 
 install: libs tools
-	install -d $(PREFIX)/bin $(LIBDIR) $(SHAREDIR)
-	install -m 755 tools/kumf $(PREFIX)/bin/kumf
-	install -m 755 tools/kumf_daemon $(PREFIX)/bin/kumf_daemon
-	install -m 755 $(BUILD_DIR)/libkumf_interc.so $(LIBDIR)/
-	install -m 755 $(BUILD_DIR)/libkumf_prof.so $(LIBDIR)/
-	install -m 755 $(BUILD_DIR)/libkumf_mlock.so $(LIBDIR)/
-	install -m 755 $(BUILD_DIR)/spe_self_profile $(LIBDIR)/
-	install -m 755 $(BUILD_DIR)/spe_preload.so $(LIBDIR)/
-	install -m 644 tools/spe_page_pac.py $(SHAREDIR)/
-	install -m 644 tools/pac_to_interc.py $(SHAREDIR)/
-	install -m 644 tools/soar_analyzer.py $(SHAREDIR)/
-	install -m 644 tools/soar_pipeline.py $(SHAREDIR)/
-	install -m 644 tools/soar_spe_report.py $(SHAREDIR)/
-	@echo "✅ Installed to $(PREFIX)/"
-	@echo "   bin/:  kumf, kumf_daemon"
-	@echo "   lib/kumf/:  libkumf_interc.so, libkumf_prof.so, libkumf_mlock.so, spe_*"
-	@echo "   share/kumf/:  spe_page_pac.py, pac_to_interc.py, soar_*.py"
+	install -d $(KUMF_HOME) $(PREFIX)/bin
+	install -m 755 tools/kumf $(KUMF_HOME)/kumf
+	install -m 755 tools/kumf_daemon $(KUMF_HOME)/kumf_daemon
+	install -m 755 $(BUILD_DIR)/libkumf_interc.so $(KUMF_HOME)/
+	install -m 755 $(BUILD_DIR)/libkumf_prof.so $(KUMF_HOME)/
+	install -m 755 $(BUILD_DIR)/libkumf_mlock.so $(KUMF_HOME)/
+	install -m 644 tools/spe_page_pac.py $(KUMF_HOME)/
+	install -m 644 tools/pac_to_interc.py $(KUMF_HOME)/
+	ln -sf $(KUMF_HOME)/kumf $(PREFIX)/bin/kumf
+	ln -sf $(KUMF_HOME)/kumf_daemon $(PREFIX)/bin/kumf_daemon
+	@echo "✅ Installed to $(KUMF_HOME)/"
+	@echo "   Symlinks: $(PREFIX)/bin/kumf, $(PREFIX)/bin/kumf_daemon"
 	@USER_HOME=$${SUDO_USER:+$$(eval echo ~$$SUDO_USER)}; \
 	USER_HOME=$${USER_HOME:-$$HOME}; \
 	if grep -q "KUMF auto-optimization" "$$USER_HOME/.bashrc" 2>/dev/null; then \
-		echo "   .bashrc: already configured"; \
-	else \
-		echo "" >> "$$USER_HOME/.bashrc"; \
-		echo "# >>> KUMF auto-optimization >>>" >> "$$USER_HOME/.bashrc"; \
-		echo "export PATH=$(PREFIX)/bin:\$$PATH" >> "$$USER_HOME/.bashrc"; \
-		echo "export LD_PRELOAD=$(LIBDIR)/libkumf_interc.so" >> "$$USER_HOME/.bashrc"; \
-		echo "# <<< KUMF auto-optimization <<<" >> "$$USER_HOME/.bashrc"; \
-		echo "   .bashrc: added KUMF config"; \
-	fi
+		sed -i '/# >>> KUMF/,/# <<< KUMF/d' "$$USER_HOME/.bashrc"; \
+	fi; \
+	echo "" >> "$$USER_HOME/.bashrc"; \
+	echo "# >>> KUMF auto-optimization >>>" >> "$$USER_HOME/.bashrc"; \
+	echo "export PATH=$(PREFIX)/bin:\$$PATH" >> "$$USER_HOME/.bashrc"; \
+	echo "export LD_PRELOAD=$(KUMF_HOME)/libkumf_interc.so" >> "$$USER_HOME/.bashrc"; \
+	echo "# <<< KUMF auto-optimization <<<" >> "$$USER_HOME/.bashrc"; \
+	echo "   .bashrc: updated"
 	@echo ""
 	@echo "Quick start:"
 	@echo "  source ~/.bashrc"
@@ -161,13 +155,13 @@ install: libs tools
 
 # Uninstall
 uninstall:
+	@rm -f $(PREFIX)/bin/kumf $(PREFIX)/bin/kumf_daemon
+	@rm -rf $(KUMF_HOME)
 	@USER_HOME=$${SUDO_USER:+$$(eval echo ~$$SUDO_USER)}; \
 	USER_HOME=$${USER_HOME:-$$HOME}; \
 	sed -i '/# >>> KUMF/,/# <<< KUMF/d' "$$USER_HOME/.bashrc" 2>/dev/null; \
 	echo "Removed from .bashrc"
-	rm -rf $(PREFIX)/bin/kumf $(PREFIX)/bin/kumf_daemon
-	rm -rf $(LIBDIR) $(SHAREDIR)
-	@echo "Uninstalled from $(PREFIX)/"
+	@echo "Uninstalled from $(KUMF_HOME)/"
 
 clean:
 	rm -rf $(BUILD_DIR)
