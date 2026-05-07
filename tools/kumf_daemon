@@ -311,7 +311,7 @@ class KumfDaemon:
 
         elif cmd == "LOOKUP":
             # interc startup query: LOOKUP:pid:exe_path
-            exe_path = parts[1] if len(parts) > 1 else ""
+            exe_path = parts[2] if len(parts) > 2 else ""
             exe_hash = hashlib.md5(exe_path.encode()).hexdigest()[:8]
             lookup_path = self.state_dir / f"lookup_{exe_hash}.conf"
             if lookup_path.exists():
