@@ -1,23 +1,33 @@
 /*
- * KUMF interc - NUMA-aware allocation routing + thread affinity
- * 
- * Lightweight LD_PRELOAD library that:
- * 1. Binds threads to NUMA nodes in round-robin (eliminates scheduling variance)
- * 2. Routes allocations to the calling thread's local NUMA node by default
- * 3. Allows config overrides for specific allocation patterns
+ * KUMF interc v2 — NUMA-aware thread affinity + optional allocation routing
+ *
+ * Two-layer design:
+ *   Layer 1 (Basic): Thread affinity + MPOL_PREFERRED → zero-overhead locality
+ *     - Bind threads to NUMA nodes (round-robin or compact)
+ *     - set_mempolicy(MPOL_PREFERRED) makes libc malloc naturally local
+ *     - malloc/calloc/realloc/free → libc directly (no mmap overhead)
+ *     - Effect = numactl --cpunodebind, but via LD_PRELOAD
+ *
+ *   Layer 2 (Enhanced): Config-driven allocation routing → precise data placement
+ *     - Only activated when KUMF_CONF has explicit rules (size_gt, size_range, etc.)
+ *     - Matched allocations → numa_alloc_onnode() (mmap-based, precise placement)
+ *     - Unmatched allocations → libc (first-touch follows thread binding)
  *
  * Env vars:
- *   KUMF_CONF      - Config file path (default: ./kumf.conf)
- *   KUMF_AFFINITY  - Thread affinity: auto|off (default: auto)
- *   KUMF_NODES     - Comma-separated node list (default: all available nodes)
+ *   KUMF_CONF      - Config file path (triggers Layer 2 when set)
+ *   KUMF_AFFINITY  - Thread affinity: auto|compact|off (default: auto)
+ *                    auto = round-robin across KUMF_NODES
+ *                    compact = fill one node before moving to next
+ *   KUMF_NODES     - Comma-separated node list (default: auto-detect)
+ *   KUMF_POLICY    - Memory policy: preferred|bind|interleave (default: preferred)
  *   KUMF_DEBUG     - Enable debug logging (any value = on)
+ *   KUMF_DAEMON    - Socket path for daemon communication (auto-config)
  *
- * Config format (KUMF_CONF):
+ * Config format (KUMF_CONF, Layer 2 only):
  *   size_gt:BYTES = NODE        — route allocations > BYTES to NODE
  *   size_lt:BYTES = NODE        — route allocations < BYTES to NODE
  *   size_range:MIN-MAX = NODE   — route MIN <= size < MAX to NODE
  *   0xADDR_START-0xADDR_END = NODE — route by caller address
- *   function_pattern = NODE     — route by function name (not implemented)
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -32,14 +42,17 @@
 #include <new>
 #include <sys/types.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <pthread.h>
 #include <sched.h>
 #include <numa.h>
 #include <numaif.h>
 #include <cerrno>
+#include <fcntl.h>
 
 /* ================================================================
- * Configuration
+ * Constants
  * ================================================================ */
 #define MAX_ADDR_RULES 8192
 #define MAX_NAME_RULES 256
@@ -47,8 +60,24 @@
 #define ADDR_HASH_BITS 16
 #define ADDR_HASH_SIZE (1 << ADDR_HASH_BITS)
 #define ADDR_HASH_MASK (ADDR_HASH_SIZE - 1)
-#define ROUTE_THRESHOLD 4096  /* only route allocs > this size */
+#define ROUTE_THRESHOLD 4096    /* Layer 2: only route allocs > this size */
 #define MAX_NUMA_NODES 128
+#define KUMF_SOCK_PATH "/tmp/kumf_daemon.sock"
+
+/* ================================================================
+ * Memory policy enum
+ * ================================================================ */
+enum kumf_mpolicy {
+    KUMF_MPOL_PREFERRED = 0,  /* Default: prefer local node, fallback anywhere */
+    KUMF_MPOL_BIND = 1,       /* Strict: only allocate from specified node */
+    KUMF_MPOL_INTERLEAVE = 2, /* Interleave across nodes */
+};
+
+/* Thread spread strategy */
+enum kumf_spread {
+    KUMF_SPREAD_ROUNDROBIN = 0, /* Round-robin across nodes (default) */
+    KUMF_SPREAD_COMPACT = 1,    /* Fill one node before moving to next */
+};
 
 /* ================================================================
  * libc function pointers
@@ -61,7 +90,7 @@ static int (*libc_pthread_create)(pthread_t *, const pthread_attr_t *,
                                    void *(*)(void *), void *);
 
 /* ================================================================
- * Address hash map for numa_alloc tracking
+ * Address hash map for numa_alloc tracking (Layer 2 only)
  * ================================================================ */
 struct addr_entry {
     unsigned long addr;
@@ -101,7 +130,7 @@ static size_t check_and_remove_seg(unsigned long addr) {
 }
 
 /* ================================================================
- * Config rules (from KUMF_CONF file)
+ * Config rules (Layer 2 — from KUMF_CONF file)
  * ================================================================ */
 struct addr_rule {
     unsigned long start;
@@ -127,6 +156,7 @@ static int num_name_rules = 0;
 static struct size_rule size_rules[MAX_NAME_RULES];
 static int num_size_rules = 0;
 static int rules_loaded = 0;
+static int layer2_active = 0;  /* 1 = KUMF_CONF has rules, route some allocs */
 static pthread_mutex_t rules_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void load_rules(void) {
@@ -137,7 +167,13 @@ static void load_rules(void) {
     const char *conf = getenv("KUMF_CONF");
     if (!conf) conf = "kumf.conf";
     FILE *f = fopen(conf, "r");
-    if (!f) { rules_loaded = 1; pthread_mutex_unlock(&rules_lock); return; }
+    if (!f) {
+        /* No config file = Layer 1 only (pure affinity, no routing) */
+        rules_loaded = 1;
+        layer2_active = 0;
+        pthread_mutex_unlock(&rules_lock);
+        return;
+    }
 
     char line[512];
     while (fgets(line, sizeof(line), f)) {
@@ -188,40 +224,41 @@ static void load_rules(void) {
         }
     }
     fclose(f);
+
+    /* Layer 2 is active only if we have actual routing rules */
+    layer2_active = (num_addr_rules + num_size_rules + num_name_rules) > 0;
     rules_loaded = 1;
     pthread_mutex_unlock(&rules_lock);
 }
 
 /* ================================================================
- * Thread Affinity Management
- * 
- * When enabled (KUMF_AFFINITY=auto, default):
- * 1. Detect NUMA topology on startup
- * 2. Bind main thread to first node
- * 3. Intercept pthread_create → assign each new thread to a node
- *    in round-robin, set CPU affinity to that node's CPUs
- * 4. Allocations without config rules → route to thread's home node
- *    (per-thread NUMA locality)
+ * Thread Affinity Management (Layer 1 — always active when enabled)
  *
- * This eliminates the variance caused by OS randomly scheduling
- * threads across NUMA nodes, which is the #1 cause of unstable
- * performance on multi-socket platforms.
+ * Core idea: bind threads → set_mempolicy → libc malloc naturally local
+ * No malloc interception needed for Layer 1!
  * ================================================================ */
 
 /* Affinity state */
-static int affinity_enabled = 0;         /* 0=off, 1=on */
-static int affinity_nodes[MAX_NUMA_NODES]; /* nodes to spread threads across */
+static int affinity_enabled = 0;
+static int affinity_nodes[MAX_NUMA_NODES];
 static int num_affinity_nodes = 0;
-static int next_node_rr = 0;             /* round-robin counter */
+static int next_node_rr = 0;
 static pthread_mutex_t affinity_rr_lock = PTHREAD_MUTEX_INITIALIZER;
+static enum kumf_spread spread_strategy = KUMF_SPREAD_ROUNDROBIN;
+static enum kumf_mpolicy mem_policy = KUMF_MPOL_PREFERRED;
 
 /* Per-thread home node (TLS) */
 static __thread int thread_home_node = -1;
+static __thread int thread_id_seq = -1;  /* sequential ID for compact spread */
 
-/* Allocation statistics (per-process, approximate) */
-static long long stat_local_allocs = 0;   /* routed to thread's home node */
-static long long stat_config_allocs = 0;  /* routed by config rules */
-static long long stat_default_allocs = 0; /* fell through to libc */
+/* Global thread counter for compact spread */
+static int global_thread_seq = 0;
+static pthread_mutex_t thread_seq_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Allocation statistics */
+static long long stat_local_allocs = 0;
+static long long stat_config_allocs = 0;
+static long long stat_default_allocs = 0;
 
 static int kumf_debug = -1;
 
@@ -236,9 +273,25 @@ static int get_debug(void) {
 } while(0)
 
 /*
+ * Get the number of CPUs in a NUMA node.
+ */
+static int node_cpu_count(int node) {
+    int count = 0;
+    struct bitmask *cpus = numa_allocate_cpumask();
+    if (!cpus) return 0;
+    if (numa_node_to_cpus(node, cpus) == 0) {
+        for (unsigned long i = 0; i < cpus->size && i < CPU_SETSIZE; i++) {
+            if (numa_bitmask_isbitset(cpus, i))
+                count++;
+        }
+    }
+    numa_free_cpumask(cpus);
+    return count;
+}
+
+/*
  * Bind current thread to a specific NUMA node.
- * Sets both CPU affinity (sched_setaffinity) and preferred memory node
- * (set_mempolicy) so that all allocations default to this node.
+ * Sets CPU affinity + memory policy = zero-overhead locality for libc malloc.
  */
 static int bind_thread_to_node(int node) {
     int ret = 0;
@@ -267,36 +320,73 @@ static int bind_thread_to_node(int node) {
         return ret;
     }
 
-    /* 2. Memory policy: prefer allocating from this node */
-    /* MPOL_PREFERRED with node mask = single node */
-    unsigned long nodemask = 0;
-    nodemask |= (1UL << node);
-    ret = set_mempolicy(MPOL_PREFERRED, &nodemask, sizeof(nodemask) * 8);
+    /* 2. Memory policy: how libc malloc places pages */
+    unsigned long nodemask = (1UL << node);
+
+    switch (mem_policy) {
+    case KUMF_MPOL_PREFERRED:
+        /* Soft: prefer this node, fallback to others if full */
+        ret = set_mempolicy(MPOL_PREFERRED, &nodemask, sizeof(nodemask) * 8);
+        break;
+
+    case KUMF_MPOL_BIND:
+        /* Hard: only allocate from this node (fail if full) */
+        ret = set_mempolicy(MPOL_BIND, &nodemask, sizeof(nodemask) * 8);
+        break;
+
+    case KUMF_MPOL_INTERLEAVE: {
+        /* Interleave across all KUMF_NODES */
+        unsigned long all_mask = 0;
+        for (int i = 0; i < num_affinity_nodes; i++)
+            all_mask |= (1UL << affinity_nodes[i]);
+        ret = set_mempolicy(MPOL_INTERLEAVE, &all_mask, sizeof(all_mask) * 8);
+        break;
+    }
+    }
+
     if (ret < 0) {
-        KUMF_LOG("set_mempolicy to node %d failed: %s", node, strerror(errno));
-        /* Non-fatal: CPU affinity is more important */
+        KUMF_LOG("set_mempolicy(mpol=%d) to node %d failed: %s",
+                 mem_policy, node, strerror(errno));
+        /* Non-fatal: CPU affinity is the primary mechanism */
     }
 
     return 0;
 }
 
 /*
- * Get next node for round-robin thread assignment.
+ * Get next node for thread assignment.
  */
 static int get_next_node(void) {
-    int idx;
-    pthread_mutex_lock(&affinity_rr_lock);
-    idx = next_node_rr++;
-    pthread_mutex_unlock(&affinity_rr_lock);
-    return affinity_nodes[idx % num_affinity_nodes];
+    if (spread_strategy == KUMF_SPREAD_COMPACT) {
+        /* Compact: fill one node's CPUs before moving to next */
+        int seq;
+        pthread_mutex_lock(&thread_seq_lock);
+        seq = global_thread_seq++;
+        pthread_mutex_unlock(&thread_seq_lock);
+
+        /* Calculate cumulative CPU counts to find which node this thread belongs to */
+        int offset = 0;
+        for (int i = 0; i < num_affinity_nodes; i++) {
+            int cpus = node_cpu_count(affinity_nodes[i]);
+            if (seq < offset + cpus) {
+                return affinity_nodes[i];
+            }
+            offset += cpus;
+        }
+        /* Overflow: round-robin the rest */
+        return affinity_nodes[seq % num_affinity_nodes];
+    } else {
+        /* Round-robin */
+        int idx;
+        pthread_mutex_lock(&affinity_rr_lock);
+        idx = next_node_rr++;
+        pthread_mutex_unlock(&affinity_rr_lock);
+        return affinity_nodes[idx % num_affinity_nodes];
+    }
 }
 
 /*
  * Thread wrapper: sets affinity before calling user's start routine.
- * 
- * We intercept pthread_create, wrap the user's start routine with this,
- * which binds the thread to its assigned NUMA node before executing
- * user code.
  */
 struct thread_wrap_args {
     void *(*start_routine)(void *);
@@ -310,7 +400,6 @@ static void *thread_entry_wrapper(void *arg) {
     void *user_arg = w->arg;
     int node = w->assigned_node;
 
-    /* Use libc_free since we allocated with libc_malloc */
     libc_free(w);
 
     /* Set thread-local home node */
@@ -318,13 +407,15 @@ static void *thread_entry_wrapper(void *arg) {
 
     /* Bind this thread to the assigned node */
     if (bind_thread_to_node(node) == 0) {
-        KUMF_LOG("Thread tid=%d bound to node %d", (int)syscall(SYS_gettid), node);
+        KUMF_LOG("Thread tid=%d bound to node %d (policy=%s)",
+                 (int)syscall(SYS_gettid), node,
+                 mem_policy == KUMF_MPOL_BIND ? "bind" :
+                 mem_policy == KUMF_MPOL_INTERLEAVE ? "interleave" : "preferred");
     } else {
         KUMF_LOG("Thread tid=%d FAILED to bind to node %d",
                  (int)syscall(SYS_gettid), node);
     }
 
-    /* Execute user's thread function */
     return start(user_arg);
 }
 
@@ -343,10 +434,8 @@ extern "C" int pthread_create(pthread_t *tid, const pthread_attr_t *attr,
         return libc_pthread_create(tid, attr, start, arg);
     }
 
-    /* Assign this thread to a NUMA node (round-robin) */
     int node = get_next_node();
 
-    /* Allocate wrapper args using libc_malloc (avoid recursion) */
     struct thread_wrap_args *w =
         (struct thread_wrap_args *)libc_malloc(sizeof(*w));
     if (!w) return ENOMEM;
@@ -357,90 +446,59 @@ extern "C" int pthread_create(pthread_t *tid, const pthread_attr_t *attr,
     return libc_pthread_create(tid, attr, thread_entry_wrapper, w);
 }
 
-/*
- * Initialize thread affinity system.
- * Called from constructor (before main).
- */
-static void init_affinity(void) {
-    const char *env = getenv("KUMF_AFFINITY");
+/* ================================================================
+ * Daemon Communication
+ *
+ * When KUMF_DAEMON is set, interc can:
+ * 1. Report its PID + thread count to the daemon
+ * 2. Receive dynamic config updates (future: hot-reload rules)
+ * ================================================================ */
+static int daemon_sock = -1;
 
-    /* Default: auto (enabled) when KUMF_CONF is set, off otherwise */
-    if (!env) {
-        const char *conf = getenv("KUMF_CONF");
-        if (conf && conf[0] != '\0') {
-            affinity_enabled = 1;  /* auto when config is present */
-        } else {
-            affinity_enabled = 0;  /* off by default without config */
-        }
-    } else if (strcmp(env, "off") == 0 || strcmp(env, "0") == 0) {
-        affinity_enabled = 0;
-        return;
-    } else {
-        /* "auto", "1", "on", "spread" — all enable affinity */
-        affinity_enabled = 1;
-    }
+static void connect_daemon(void) {
+    const char *sock_path = getenv("KUMF_DAEMON");
+    if (!sock_path) sock_path = KUMF_SOCK_PATH;
 
-    /* Check NUMA availability */
-    if (numa_available() < 0) {
-        KUMF_LOG("NUMA not available, affinity disabled");
-        affinity_enabled = 0;
-        return;
-    }
+    daemon_sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (daemon_sock < 0) return;
 
-    /* Parse KUMF_NODES or auto-detect all available nodes */
-    const char *nodes_env = getenv("KUMF_NODES");
-    if (nodes_env) {
-        char *buf = strdup(nodes_env);
-        char *tok = strtok(buf, ",");
-        while (tok && num_affinity_nodes < MAX_NUMA_NODES) {
-            int n = atoi(tok);
-            /* Verify node exists */
-            if (numa_node_size(n, NULL) >= 0) {
-                affinity_nodes[num_affinity_nodes++] = n;
-            } else {
-                KUMF_LOG("KUMF_NODES: node %d not available, skipping", n);
-            }
-            tok = strtok(NULL, ",");
-        }
-        free(buf);
-    } else {
-        /* Auto-detect: use all available NUMA nodes */
-        int max_node = numa_max_node();
-        for (int i = 0; i <= max_node && num_affinity_nodes < MAX_NUMA_NODES; i++) {
-            if (numa_node_size(i, NULL) > 0) {
-                affinity_nodes[num_affinity_nodes++] = i;
-            }
-        }
-    }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
-    if (num_affinity_nodes == 0) {
-        KUMF_LOG("No NUMA nodes available, affinity disabled");
-        affinity_enabled = 0;
-        return;
-    }
+    /* Send registration message */
+    char msg[128];
+    snprintf(msg, sizeof(msg), "REG:%d:%d", getpid(), num_affinity_nodes);
+    sendto(daemon_sock, msg, strlen(msg), 0,
+           (struct sockaddr *)&addr, sizeof(addr));
 
-    /* Bind main thread to first node */
-    thread_home_node = affinity_nodes[0];
-    if (bind_thread_to_node(thread_home_node) == 0) {
-        KUMF_LOG("Main thread bound to node %d", thread_home_node);
-    }
+    KUMF_LOG("Registered with daemon at %s (pid=%d)", sock_path, getpid());
+}
 
-    KUMF_LOG("Affinity enabled: %d nodes [%s]",
-             num_affinity_nodes,
-             nodes_env ? nodes_env : "auto");
-
-    /* Print node info */
-    for (int i = 0; i < num_affinity_nodes; i++) {
-        int n = affinity_nodes[i];
-        long free_mem;
-        long total_mem = numa_node_size(n, &free_mem);
-        KUMF_LOG("  Node %d: %ld MB total, %ld MB free",
-                 n, total_mem / (1024*1024), free_mem / (1024*1024));
+static void disconnect_daemon(void) {
+    if (daemon_sock >= 0) {
+        /* Send deregistration */
+        char msg[64];
+        snprintf(msg, sizeof(msg), "DEREG:%d", getpid());
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, KUMF_SOCK_PATH, sizeof(addr.sun_path) - 1);
+        sendto(daemon_sock, msg, strlen(msg), 0,
+               (struct sockaddr *)&addr, sizeof(addr));
+        close(daemon_sock);
+        daemon_sock = -1;
     }
 }
 
 /* ================================================================
- * Node resolution: config rules → thread-local → -1 (libc fallback)
+ * Node resolution: config rules only (Layer 2)
+ *
+ * Layer 1 does NOT intercept malloc — it relies on:
+ *   sched_setaffinity + set_mempolicy → libc malloc is naturally local
+ *
+ * Layer 2 intercepts only when config rules match.
  * ================================================================ */
 
 static int match_addr(void *caller) {
@@ -464,47 +522,56 @@ static int match_size(size_t sz) {
 
 /*
  * Resolve which NUMA node an allocation should go to.
- * Priority:
- *   1. Config rules (size-based, addr-based) — explicit routing
- *   2. Thread home node — per-thread NUMA locality
- *   3. -1 — fall through to libc (first-touch by OS)
+ * Only called when Layer 2 is active AND size > ROUTE_THRESHOLD.
+ * Returns:
+ *   >= 0  → route to this node via numa_alloc_onnode()
+ *   -1    → let libc handle it (first-touch follows thread binding)
  */
 static int resolve_node(void *caller, size_t sz) {
-    /* 1. Config rules take priority */
+    /* Only route if Layer 2 is active (has config rules) */
+    if (!layer2_active) return -1;
+
+    /* 1. Size-based rules */
     int node = match_size(sz);
     if (node >= 0) {
-        KUMF_LOG("config(size): sz=%zu -> node %d", sz, node);
+        KUMF_LOG("L2 config(size): sz=%zu -> node %d", sz, node);
         __sync_fetch_and_add(&stat_config_allocs, 1);
         return node;
     }
+
+    /* 2. Address-based rules */
     node = match_addr(caller);
     if (node >= 0) {
-        KUMF_LOG("config(addr): caller=%p sz=%zu -> node %d", caller, sz, node);
+        KUMF_LOG("L2 config(addr): caller=%p sz=%zu -> node %d", caller, sz, node);
         __sync_fetch_and_add(&stat_config_allocs, 1);
         return node;
     }
 
-    /* 2. Thread-local node (affinity mode) */
-    if (affinity_enabled && thread_home_node >= 0) {
-        KUMF_LOG("thread_local: sz=%zu -> node %d", sz, thread_home_node);
-        __sync_fetch_and_add(&stat_local_allocs, 1);
-        return thread_home_node;
-    }
-
-    /* 3. No rule, no affinity — let libc decide */
-    __sync_fetch_and_add(&stat_default_allocs, 1);
+    /* No rule match → libc handles it (Layer 1 affinity ensures locality) */
+    __sync_fetch_and_add(&stat_local_allocs, 1);
     return -1;
 }
 
 /* ================================================================
  * LD_PRELOAD hooks: malloc/calloc/realloc/free
+ *
+ * Layer 1 (no KUMF_CONF or empty rules):
+ *   - All calls pass through to libc directly
+ *   - Locality comes from set_mempolicy, not from interception
+ *   - ZERO overhead vs plain libc
+ *
+ * Layer 2 (KUMF_CONF with rules):
+ *   - Large allocs (>ROUTE_THRESHOLD) check rules
+ *   - Matched → numa_alloc_onnode() (precise placement)
+ *   - Unmatched → libc (first-touch follows thread binding)
  * ================================================================ */
 
 extern "C" void *malloc(size_t sz)
 {
     if (!libc_malloc) { libc_malloc = (void *(*)(size_t))dlsym(RTLD_NEXT, "malloc"); }
-    
-    if (sz > ROUTE_THRESHOLD) {
+
+    /* Layer 2: check if routing is needed */
+    if (layer2_active && sz > ROUTE_THRESHOLD) {
         load_rules();
         void *caller = __builtin_return_address(0);
         int node = resolve_node(caller, sz);
@@ -518,15 +585,17 @@ extern "C" void *malloc(size_t sz)
             KUMF_LOG("malloc(%zu) node %d failed, fallback to libc", sz, node);
         }
     }
+
+    /* Layer 1 or unmatched: pure libc (set_mempolicy ensures locality) */
     return libc_malloc(sz);
 }
 
 extern "C" void *calloc(size_t nmemb, size_t size)
 {
     if (!libc_calloc) { libc_calloc = (void *(*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc"); }
-    
+
     size_t total = nmemb * size;
-    if (total > ROUTE_THRESHOLD) {
+    if (layer2_active && total > ROUTE_THRESHOLD) {
         load_rules();
         void *caller = __builtin_return_address(0);
         int node = resolve_node(caller, total);
@@ -537,9 +606,9 @@ extern "C" void *calloc(size_t nmemb, size_t size)
                 record_seg((unsigned long)addr, total);
                 return addr;
             }
-            KUMF_LOG("calloc(%zu) node %d failed, fallback to libc", total, node);
         }
     }
+
     return libc_calloc(nmemb, size);
 }
 
@@ -580,12 +649,102 @@ void operator delete(void *ptr) noexcept { free(ptr); }
 void operator delete[](void *ptr) noexcept { free(ptr); }
 
 /* ================================================================
- * Constructor / Destructor
+ * Initialization
  * ================================================================ */
+
+static void init_affinity(void) {
+    const char *env = getenv("KUMF_AFFINITY");
+
+    /* Default: auto (enabled) — always provide affinity for KUMF value */
+    if (!env || strcmp(env, "auto") == 0 || strcmp(env, "1") == 0 || strcmp(env, "on") == 0) {
+        affinity_enabled = 1;
+    } else if (strcmp(env, "compact") == 0) {
+        affinity_enabled = 1;
+        spread_strategy = KUMF_SPREAD_COMPACT;
+    } else if (strcmp(env, "off") == 0 || strcmp(env, "0") == 0) {
+        affinity_enabled = 0;
+        return;
+    } else {
+        affinity_enabled = 1;
+    }
+
+    /* Check NUMA availability */
+    if (numa_available() < 0) {
+        KUMF_LOG("NUMA not available, affinity disabled");
+        affinity_enabled = 0;
+        return;
+    }
+
+    /* Parse KUMF_NODES or auto-detect */
+    const char *nodes_env = getenv("KUMF_NODES");
+    if (nodes_env) {
+        char *buf = strdup(nodes_env);
+        char *tok = strtok(buf, ",");
+        while (tok && num_affinity_nodes < MAX_NUMA_NODES) {
+            int n = atoi(tok);
+            if (numa_node_size(n, NULL) >= 0) {
+                affinity_nodes[num_affinity_nodes++] = n;
+            } else {
+                KUMF_LOG("KUMF_NODES: node %d not available, skipping", n);
+            }
+            tok = strtok(NULL, ",");
+        }
+        free(buf);
+    } else {
+        /* Auto-detect: use all available NUMA nodes */
+        int max_node = numa_max_node();
+        for (int i = 0; i <= max_node && num_affinity_nodes < MAX_NUMA_NODES; i++) {
+            if (numa_node_size(i, NULL) > 0) {
+                affinity_nodes[num_affinity_nodes++] = i;
+            }
+        }
+    }
+
+    if (num_affinity_nodes == 0) {
+        KUMF_LOG("No NUMA nodes available, affinity disabled");
+        affinity_enabled = 0;
+        return;
+    }
+
+    /* Parse KUMF_POLICY */
+    const char *policy_env = getenv("KUMF_POLICY");
+    if (policy_env) {
+        if (strcmp(policy_env, "bind") == 0) {
+            mem_policy = KUMF_MPOL_BIND;
+        } else if (strcmp(policy_env, "interleave") == 0) {
+            mem_policy = KUMF_MPOL_INTERLEAVE;
+        } else {
+            mem_policy = KUMF_MPOL_PREFERRED;  /* default */
+        }
+    }
+
+    /* Bind main thread to first node */
+    thread_home_node = affinity_nodes[0];
+    if (bind_thread_to_node(thread_home_node) == 0) {
+        KUMF_LOG("Main thread bound to node %d (policy=%s, spread=%s)",
+                 thread_home_node,
+                 mem_policy == KUMF_MPOL_BIND ? "bind" :
+                 mem_policy == KUMF_MPOL_INTERLEAVE ? "interleave" : "preferred",
+                 spread_strategy == KUMF_SPREAD_COMPACT ? "compact" : "round-robin");
+    }
+
+    KUMF_LOG("Affinity: %d nodes [%s]",
+             num_affinity_nodes,
+             nodes_env ? nodes_env : "auto");
+
+    for (int i = 0; i < num_affinity_nodes; i++) {
+        int n = affinity_nodes[i];
+        long free_mem;
+        long total_mem = numa_node_size(n, &free_mem);
+        int cpus = node_cpu_count(n);
+        KUMF_LOG("  Node %d: %d CPUs, %ld MB total, %ld MB free",
+                 n, cpus, total_mem / (1024*1024), free_mem / (1024*1024));
+    }
+}
 
 __attribute__((constructor))
 static void kumf_init(void) {
-    /* Resolve libc functions early (before any allocation) */
+    /* Resolve libc functions early */
     libc_malloc = (void *(*)(size_t))dlsym(RTLD_NEXT, "malloc");
     libc_calloc = (void *(*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
     libc_realloc = (void *(*)(void *, size_t))dlsym(RTLD_NEXT, "realloc");
@@ -594,21 +753,27 @@ static void kumf_init(void) {
                                     void *(*)(void *), void *))
                            dlsym(RTLD_NEXT, "pthread_create");
 
-    /* Load config rules */
+    /* Load config rules (determines Layer 2 activation) */
     load_rules();
 
-    /* Initialize thread affinity */
+    /* Initialize thread affinity (Layer 1) */
     init_affinity();
 
-    KUMF_LOG("KUMF interc loaded (affinity=%s, rules=%d size + %d addr)",
+    /* Connect to daemon if available */
+    connect_daemon();
+
+    KUMF_LOG("KUMF interc v2 loaded (L1=affinity:%s, L2=routing:%s, rules=%d size + %d addr)",
              affinity_enabled ? "on" : "off",
+             layer2_active ? "on" : "off",
              num_size_rules, num_addr_rules);
 }
 
 __attribute__((destructor))
 static void kumf_fini(void) {
+    disconnect_daemon();
+
     if (stat_local_allocs + stat_config_allocs + stat_default_allocs > 0) {
-        KUMF_LOG("Stats: local=%lld config=%lld default=%lld",
+        KUMF_LOG("Stats: L1_local=%lld L2_config=%lld libc=%lld",
                  stat_local_allocs, stat_config_allocs, stat_default_allocs);
     }
 }

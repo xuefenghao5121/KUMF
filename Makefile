@@ -116,14 +116,19 @@ $(BUILD_DIR)/spe_preload.so: src/tools/spe_preload.c src/tools/spe_self_profile.
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-# Install kumf CLI
+# Install kumf CLI + daemon
 PREFIX ?= $(HOME)/.local
 
 install: tools
 	install -d $(PREFIX)/bin
 	install -m 755 tools/kumf $(PREFIX)/bin/kumf
-	@echo "✅ Installed: $(PREFIX)/bin/kumf"
+	install -m 755 tools/kumf_daemon $(PREFIX)/bin/kumf_daemon
+	@echo "✅ Installed: $(PREFIX)/bin/kumf, $(PREFIX)/bin/kumf_daemon"
 	@echo "   Add to PATH: export PATH=$(PREFIX)/bin:\$$PATH"
+	@echo ""
+	@echo "Quick start:"
+	@echo "  kumf daemon start"
+	@echo "  kumf daemon wrap -- ./your_workload"
 
 clean:
 	rm -rf $(BUILD_DIR)

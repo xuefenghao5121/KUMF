@@ -1,0 +1,698 @@
+#!/usr/bin/env python3
+"""
+kumf daemon — Transparent NUMA optimization daemon
+
+Runs as a background service that:
+1. Auto-detects NUMA topology on startup
+2. Provides LD_PRELOAD injection for any process (via kumf wrap)
+3. Can auto-profile workloads and generate optimal config
+4. Monitors running processes and adjusts affinity dynamically
+
+Usage:
+  kumf daemon start [--foreground] [--socket PATH]
+  kumf daemon stop
+  kumf daemon status
+  kumf daemon wrap [-- CMD...]
+  kumf daemon profile -- CMD...
+  kumf daemon config
+"""
+
+import os
+import sys
+import json
+import time
+import socket
+import signal
+import subprocess
+import argparse
+import threading
+import hashlib
+from pathlib import Path
+from datetime import datetime
+
+# Paths
+KUMF_ROOT = Path(__file__).resolve().parent.parent
+BUILD_DIR = KUMF_ROOT / "build"
+INTERC_SO = BUILD_DIR / "libkumf_interc.so"
+PROF_SO = BUILD_DIR / "libkumf_prof.so"
+DEFAULT_SOCK = "/tmp/kumf_daemon.sock"
+DEFAULT_PID_FILE = "/tmp/kumf_daemon.pid"
+DEFAULT_STATE_DIR = Path("/tmp/kumf_daemon")
+SPE_PAGE_PAC = KUMF_ROOT / "tools" / "spe_page_pac.py"
+PAC_TO_INTERC = KUMF_ROOT / "tools" / "pac_to_interc.py"
+
+
+# ============================================================
+# NUMA Topology Detection
+# ============================================================
+
+def detect_numa_topology():
+    """Detect NUMA topology and determine optimal configuration."""
+    topology = {
+        "nodes": [],
+        "distances": [],
+        "sockets": [],
+        "recommended_nodes": [],
+        "recommended_policy": "preferred",
+        "recommended_spread": "compact",
+    }
+
+    try:
+        result = subprocess.run(
+            ["numactl", "-H"], capture_output=True, text=True, timeout=10
+        )
+        lines = result.stdout.strip().split("\n")
+
+        for line in lines:
+            if line.startswith("node ") and "size" in line:
+                parts = line.split()
+                node_id = int(parts[1])
+                mem_mb = int(parts[3])
+                topology["nodes"].append({
+                    "id": node_id,
+                    "mem_mb": mem_mb,
+                })
+            elif line.startswith("node distances:"):
+                # Parse distance matrix
+                idx = lines.index(line) + 1
+                while idx < len(lines) and lines[idx].startswith("node "):
+                    dist_parts = lines[idx].split(":")
+                    if len(dist_parts) == 2:
+                        row = [int(x) for x in dist_parts[1].split()]
+                        topology["distances"].append(row)
+                    idx += 1
+    except Exception as e:
+        print(f"Warning: NUMA detection failed: {e}", file=sys.stderr)
+
+    # Group nodes by socket (distance 10-12 = same socket, 30+ = cross-socket)
+    if topology["distances"]:
+        n = len(topology["nodes"])
+        visited = set()
+        sockets = []
+        for i in range(n):
+            if i in visited:
+                continue
+            socket_nodes = [i]
+            visited.add(i)
+            for j in range(i + 1, n):
+                if j not in visited and topology["distances"][i][j] <= 20:
+                    socket_nodes.append(j)
+                    visited.add(j)
+            sockets.append(socket_nodes)
+        topology["sockets"] = sockets
+
+        # For stability: recommend using first socket only (like cpunodebind=0,1)
+        if sockets:
+            topology["recommended_nodes"] = sockets[0]
+            topology["recommended_policy"] = "preferred"
+            topology["recommended_spread"] = "compact"
+
+    return topology
+
+
+def get_optimal_config(topology):
+    """Generate optimal KUMF environment variables based on topology."""
+    nodes = topology.get("recommended_nodes", [])
+    if not nodes:
+        nodes = [n["id"] for n in topology.get("nodes", [])]
+
+    return {
+        "KUMF_AFFINITY": topology.get("recommended_spread", "compact"),
+        "KUMF_NODES": ",".join(str(n) for n in nodes),
+        "KUMF_POLICY": topology.get("recommended_policy", "preferred"),
+    }
+
+
+# ============================================================
+# Daemon Server
+# ============================================================
+
+class KumfDaemon:
+    """KUMF daemon: manages per-process NUMA optimization."""
+
+    def __init__(self, socket_path=DEFAULT_SOCK, state_dir=DEFAULT_STATE_DIR):
+        self.socket_path = socket_path
+        self.state_dir = Path(state_dir)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.pid_file = DEFAULT_PID_FILE
+        self.topology = detect_numa_topology()
+        self.optimal_config = get_optimal_config(self.topology)
+        self.registered_procs = {}  # pid -> info
+        self.profiles = {}  # cmd_hash -> profile data
+        self.running = True
+        self.sock = None
+
+    def start(self, foreground=False):
+        """Start the daemon."""
+        # Check if already running
+        if self._is_running():
+            print(f"KUMF daemon already running (PID {self._read_pid()})")
+            return 0
+
+        # Clean up stale socket
+        if os.path.exists(self.socket_path):
+            os.unlink(self.socket_path)
+
+        if foreground:
+            return self._run()
+        else:
+            # Daemonize
+            pid = os.fork()
+            if pid > 0:
+                # Parent: wait for daemon to start
+                time.sleep(0.5)
+                if self._is_running():
+                    print(f"KUMF daemon started (PID {self._read_pid()})")
+                    return 0
+                else:
+                    print("KUMF daemon failed to start", file=sys.stderr)
+                    return 1
+            # Child: become daemon
+            os.setsid()
+            pid2 = os.fork()
+            if pid2 > 0:
+                os._exit(0)
+
+            # Redirect stdio
+            devnull = os.open(os.devnull, os.O_RDWR)
+            os.dup2(devnull, 0)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            os.close(devnull)
+
+            return self._run()
+
+    def _run(self):
+        """Main daemon loop."""
+        # Write PID file
+        with open(self.pid_file, 'w') as f:
+            f.write(str(os.getpid()))
+
+        # Save topology
+        topo_path = self.state_dir / "topology.json"
+        with open(topo_path, 'w') as f:
+            json.dump(self.topology, f, indent=2)
+
+        # Save optimal config
+        config_path = self.state_dir / "auto_config.json"
+        with open(config_path, 'w') as f:
+            json.dump(self.optimal_config, f, indent=2)
+
+        # Create Unix domain socket
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.sock.bind(self.socket_path)
+        self.sock.settimeout(1.0)
+
+        # Signal handler
+        def handle_signal(signum, frame):
+            self.running = False
+
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+
+        # Main loop
+        while self.running:
+            try:
+                data, addr = self.sock.recvfrom(4096)
+                msg = data.decode('utf-8', errors='replace')
+                response = self._handle_message(msg)
+                if response and addr:
+                    self.sock.sendto(response.encode(), addr)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"Daemon error: {e}", file=sys.stderr)
+
+        # Cleanup
+        self.sock.close()
+        os.unlink(self.socket_path) if os.path.exists(self.socket_path) else None
+        os.unlink(self.pid_file) if os.path.exists(self.pid_file) else None
+
+        return 0
+
+    def _handle_message(self, msg):
+        """Handle incoming daemon messages."""
+        parts = msg.split(":", 2)
+        cmd = parts[0] if parts else ""
+
+        if cmd == "REG":
+            # Process registration: REG:pid:node_count
+            pid = int(parts[1]) if len(parts) > 1 else 0
+            node_count = int(parts[2]) if len(parts) > 2 else 0
+            self.registered_procs[pid] = {
+                "pid": pid,
+                "node_count": node_count,
+                "registered_at": datetime.now().isoformat(),
+            }
+            return "OK:REG"
+
+        elif cmd == "DEREG":
+            pid = int(parts[1]) if len(parts) > 1 else 0
+            self.registered_procs.pop(pid, None)
+            return "OK:DEREG"
+
+        elif cmd == "STATUS":
+            return json.dumps({
+                "daemon_pid": os.getpid(),
+                "topology": {
+                    "nodes": len(self.topology["nodes"]),
+                    "sockets": len(self.topology.get("sockets", [])),
+                },
+                "optimal_config": self.optimal_config,
+                "registered_processes": len(self.registered_procs),
+                "profiles": len(self.profiles),
+            })
+
+        elif cmd == "CONFIG":
+            # Return optimal config for a process
+            return json.dumps(self.optimal_config)
+
+        elif cmd == "WRAP":
+            # Return LD_PRELOAD environment for wrapping a process
+            env = {
+                "LD_PRELOAD": str(INTERC_SO),
+                **self.optimal_config,
+            }
+            # Check if we have a profile for this command
+            if len(parts) > 1:
+                cmd_hash = hashlib.md5(parts[1].encode()).hexdigest()[:8]
+                profile_path = self.state_dir / f"profile_{cmd_hash}.conf"
+                if profile_path.exists():
+                    env["KUMF_CONF"] = str(profile_path)
+
+            env["KUMF_DAEMON"] = self.socket_path
+            return json.dumps(env)
+
+        elif cmd == "PING":
+            return "PONG"
+
+        return "ERR:UNKNOWN"
+
+    def stop(self):
+        """Stop the daemon."""
+        pid = self._read_pid()
+        if not pid:
+            print("KUMF daemon is not running")
+            return 1
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.5)
+            if self._is_running():
+                os.kill(pid, signal.SIGKILL)
+            print(f"KUMF daemon stopped (PID {pid})")
+            return 0
+        except ProcessLookupError:
+            print("KUMF daemon process not found (cleaning up)")
+            self._cleanup()
+            return 0
+
+    def status(self):
+        """Show daemon status."""
+        pid = self._read_pid()
+        if not pid:
+            print("KUMF daemon: not running")
+            return 1
+
+        # Try to query daemon
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            sock.settimeout(2.0)
+            sock.sendto(b"STATUS", self.socket_path)
+            data, _ = sock.recvfrom(4096)
+            sock.close()
+
+            status = json.loads(data.decode())
+            topo = status.get("topology", {})
+            config = status.get("optimal_config", {})
+
+            print(f"KUMF daemon: running (PID {status['daemon_pid']})")
+            print(f"  NUMA: {topo.get('nodes', '?')} nodes, {topo.get('sockets', '?')} sockets")
+            print(f"  Optimal config:")
+            for k, v in config.items():
+                print(f"    {k}={v}")
+            print(f"  Registered processes: {status.get('registered_processes', 0)}")
+            print(f"  Profiles: {status.get('profiles', 0)}")
+            return 0
+        except Exception as e:
+            print(f"KUMF daemon: running (PID {pid}) but not responding: {e}")
+            return 1
+
+    def wrap(self, cmd):
+        """Wrap a command with KUMF optimization."""
+        if not INTERC_SO.exists():
+            print(f"Error: {INTERC_SO} not found (run: make libs)", file=sys.stderr)
+            return 1
+
+        # Get config from daemon or use auto-detected config
+        env_overrides = {}
+        daemon_running = self._is_running()
+
+        if daemon_running:
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+                sock.settimeout(2.0)
+                client_addr = f"/tmp/kumf_wrap_{os.getpid()}"
+                if os.path.exists(client_addr):
+                    os.unlink(client_addr)
+                sock.bind(client_addr)
+                sock.sendto(f"WRAP:{json.dumps(cmd)}".encode(), self.socket_path)
+                data, _ = sock.recvfrom(4096)
+                sock.close()
+                os.unlink(client_addr)
+                env_overrides = json.loads(data.decode())
+            except Exception:
+                # Fallback to local config
+                env_overrides = {
+                    "LD_PRELOAD": str(INTERC_SO),
+                    **self.optimal_config,
+                }
+        else:
+            # Auto-detect locally (daemon not needed for basic mode)
+            env_overrides = {
+                "LD_PRELOAD": str(INTERC_SO),
+                **self.optimal_config,
+            }
+
+        # Execute wrapped command
+        env = os.environ.copy()
+        env.update(env_overrides)
+
+        # Append to existing LD_PRELOAD if any
+        existing_preload = os.environ.get("LD_PRELOAD", "")
+        if existing_preload:
+            env["LD_PRELOAD"] = f"{env_overrides.get('LD_PRELOAD', '')}:{existing_preload}"
+
+        print(f"🚀 KUMF wrapping: {' '.join(cmd)}")
+        if env_overrides.get("KUMF_AFFINITY"):
+            print(f"   Affinity: {env_overrides.get('KUMF_AFFINITY')}")
+        if env_overrides.get("KUMF_NODES"):
+            print(f"   Nodes: {env_overrides.get('KUMF_NODES')}")
+        if env_overrides.get("KUMF_POLICY"):
+            print(f"   Policy: {env_overrides.get('KUMF_POLICY')}")
+        if env_overrides.get("KUMF_CONF"):
+            print(f"   Config: {env_overrides.get('KUMF_CONF')}")
+        print()
+
+        try:
+            result = subprocess.run(cmd, env=env)
+            return result.returncode
+        except KeyboardInterrupt:
+            return 130
+
+    def profile(self, cmd, min_lat=32, output_dir=None):
+        """Profile a workload and generate optimal config."""
+        if not INTERC_SO.exists():
+            print(f"Error: {INTERC_SO} not found (run: make libs)", file=sys.stderr)
+            return 1
+
+        if not PROF_SO.exists():
+            print(f"Error: {PROF_SO} not found (run: make libs)", file=sys.stderr)
+            return 1
+
+        cmd_hash = hashlib.md5(json.dumps(cmd).encode()).hexdigest()[:8]
+        if not output_dir:
+            output_dir = self.state_dir / f"profile_{cmd_hash}"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"╔══════════════════════════════════════════════════╗")
+        print(f"║       KUMF Auto-Profile                          ║")
+        print(f"╚══════════════════════════════════════════════════╝")
+        print()
+
+        # Step 1: Baseline run with affinity only
+        print("── Step 1/3: Baseline (affinity only) ──────────────")
+        env = os.environ.copy()
+        env["LD_PRELOAD"] = str(INTERC_SO)
+        env["KUMF_AFFINITY"] = "compact"
+        env["KUMF_NODES"] = ",".join(str(n) for n in self.optimal_config.get("KUMF_NODES", "").split(","))
+        env["KUMF_POLICY"] = "preferred"
+
+        t0 = time.time()
+        result = subprocess.run(cmd, env=env, capture_output=True, timeout=600)
+        baseline_time = time.time() - t0
+        print(f"   Baseline: {baseline_time:.2f}s (exit={result.returncode})")
+        print()
+
+        # Step 2: Profile with SPE
+        print("── Step 2/3: SPE Profiling ────────────────────────")
+        spe_data = output_dir / "spe.perf"
+        os.makedirs("/tmp/kumf", exist_ok=True)
+
+        env_prof = os.environ.copy()
+        env_prof["LD_PRELOAD"] = str(PROF_SO)
+
+        spe_event = f"arm_spe/load_filter=1,store_filter=1,min_latency={min_lat}/"
+        perf_cmd = [
+            "perf", "record", "-e", spe_event,
+            "-o", str(spe_data), "--"
+        ] + cmd
+
+        t0 = time.time()
+        try:
+            result = subprocess.run(perf_cmd, env=env_prof, timeout=600)
+            profile_time = time.time() - t0
+            print(f"   Profiled: {profile_time:.2f}s")
+        except Exception as e:
+            print(f"   Profiling failed: {e}")
+            print("   (SPE may not be available on this platform)")
+            print()
+            print("✅ Baseline config saved (affinity-only mode)")
+            # Save affinity-only config as the profile
+            conf_path = output_dir / "kumf.conf"
+            conf_path.write_text("# KUMF auto-config: affinity only (no SPE data)\n")
+            self._save_profile(cmd_hash, str(conf_path), baseline_time)
+            return 0
+        print()
+
+        # Step 3: Analyze SPE → generate config
+        print("── Step 3/3: Analysis → Config ────────────────────")
+        if spe_data.exists():
+            pac_csv = output_dir / "page_pac.csv"
+
+            perf_report = subprocess.Popen(
+                ["perf", "report", "-D", "-i", str(spe_data)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            pac_result = subprocess.run(
+                [sys.executable, str(SPE_PAGE_PAC), "-o", str(output_dir)],
+                stdin=perf_report.stdout, capture_output=True
+            )
+            perf_report.stdout.close()
+            perf_report.wait()
+
+            if pac_csv.exists():
+                prof_files = sorted(Path("/tmp/kumf").glob("data.raw.*"))
+                conf_path = output_dir / "kumf.conf"
+
+                if prof_files:
+                    interc_cmd = [
+                        sys.executable, str(PAC_TO_INTERC),
+                        "--pac-csv", str(pac_csv),
+                        "--prof-log", str(prof_files[0]),
+                        "--mode", "alloc", "-o", str(conf_path),
+                    ]
+                else:
+                    interc_cmd = [
+                        sys.executable, str(PAC_TO_INTERC),
+                        "--pac-csv", str(pac_csv),
+                        "--mode", "size", "-o", str(conf_path),
+                    ]
+
+                subprocess.run(interc_cmd)
+                print(f"   Config: {conf_path}")
+                self._save_profile(cmd_hash, str(conf_path), baseline_time)
+            else:
+                print("   No PAC data generated")
+                conf_path = output_dir / "kumf.conf"
+                conf_path.write_text("# KUMF auto-config: affinity only\n")
+                self._save_profile(cmd_hash, str(conf_path), baseline_time)
+        else:
+            print("   No SPE data captured")
+
+        print()
+        print(f"✅ Profile saved for: {' '.join(cmd)}")
+        print(f"   Baseline: {baseline_time:.2f}s")
+        print(f"   Next run: kumf daemon wrap -- {' '.join(cmd)}")
+        return 0
+
+    def _save_profile(self, cmd_hash, conf_path, baseline_time):
+        """Save profile to daemon state."""
+        profile = {
+            "cmd_hash": cmd_hash,
+            "conf_path": conf_path,
+            "baseline_time": baseline_time,
+            "profiled_at": datetime.now().isoformat(),
+        }
+        self.profiles[cmd_hash] = profile
+
+        # Persist to disk
+        profile_path = self.state_dir / f"profile_{cmd_hash}.json"
+        with open(profile_path, 'w') as f:
+            json.dump(profile, f, indent=2)
+
+        # Symlink config for WRAP command
+        link_path = self.state_dir / f"profile_{cmd_hash}.conf"
+        try:
+            if link_path.exists() or link_path.is_symlink():
+                link_path.unlink()
+            link_path.symlink_to(conf_path)
+        except Exception:
+            # Fallback: copy the config
+            import shutil
+            shutil.copy2(conf_path, link_path)
+
+    def _is_running(self):
+        """Check if daemon is running."""
+        pid = self._read_pid()
+        if not pid:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            self._cleanup()
+            return False
+
+    def _read_pid(self):
+        """Read PID file."""
+        try:
+            with open(self.pid_file, 'r') as f:
+                return int(f.read().strip())
+        except (FileNotFoundError, ValueError):
+            return None
+
+    def _cleanup(self):
+        """Clean up stale files."""
+        for path in [self.pid_file, self.socket_path]:
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+            except Exception:
+                pass
+
+
+# ============================================================
+# Shell integration (for .bashrc / .profile)
+# ============================================================
+
+BASH_INTEGRATION = '''
+# KUMF auto-optimization — add to ~/.bashrc
+if command -v kumf &>/dev/null; then
+    # Auto-wrap commands with KUMF when daemon is running
+    kumf daemon autostart 2>/dev/null
+fi
+'''
+
+FISH_INTEGRATION = '''
+# KUMF auto-optimization — add to ~/.config/fish/config.fish
+if command -v kumf &>/dev/null
+    kumf daemon autostart 2>/dev/null
+end
+'''
+
+
+def print_shell_integration():
+    """Print shell integration snippets."""
+    print("# Add to ~/.bashrc for automatic KUMF optimization:")
+    print(BASH_INTEGRATION)
+    print()
+    print("# Add to ~/.config/fish/config.fish:")
+    print(FISH_INTEGRATION)
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="kumf daemon",
+        description="KUMF daemon — transparent NUMA optimization"
+    )
+    sub = parser.add_subparsers(dest="daemon_cmd")
+
+    # start
+    p_start = sub.add_parser("start", help="Start the KUMF daemon")
+    p_start.add_argument("--foreground", "-f", action="store_true", help="Run in foreground")
+    p_start.add_argument("--socket", default=DEFAULT_SOCK, help="Unix socket path")
+
+    # stop
+    sub.add_parser("stop", help="Stop the KUMF daemon")
+
+    # status
+    sub.add_parser("status", help="Show daemon status")
+
+    # wrap
+    p_wrap = sub.add_parser("wrap", help="Wrap a command with KUMF optimization")
+    p_wrap.add_argument("command", nargs=argparse.REMAINDER, help="Command to wrap")
+
+    # profile
+    p_prof = sub.add_parser("profile", help="Profile workload and generate config")
+    p_prof.add_argument("--min-lat", type=int, default=32, help="SPE min latency filter")
+    p_prof.add_argument("-o", "--output", default=None, help="Output directory")
+    p_prof.add_argument("command", nargs=argparse.REMAINDER, help="Command to profile")
+
+    # config
+    sub.add_parser("config", help="Show auto-detected optimal config")
+
+    # autostart
+    sub.add_parser("autostart", help="Start daemon if not running (for shell rc)")
+
+    # shell-init
+    sub.add_parser("shell-init", help="Print shell integration snippets")
+
+    args = parser.parse_args()
+
+    daemon = KumfDaemon()
+
+    if args.daemon_cmd == "start":
+        return daemon.start(foreground=args.foreground)
+    elif args.daemon_cmd == "stop":
+        return daemon.stop()
+    elif args.daemon_cmd == "status":
+        return daemon.status()
+    elif args.daemon_cmd == "wrap":
+        cmd = args.command
+        if cmd and cmd[0] == "--":
+            cmd = cmd[1:]
+        if not cmd:
+            print("Error: no command specified", file=sys.stderr)
+            return 1
+        return daemon.wrap(cmd)
+    elif args.daemon_cmd == "profile":
+        cmd = args.command
+        if cmd and cmd[0] == "--":
+            cmd = cmd[1:]
+        if not cmd:
+            print("Error: no command specified", file=sys.stderr)
+            return 1
+        return daemon.profile(cmd, min_lat=args.min_lat, output_dir=args.output)
+    elif args.daemon_cmd == "config":
+        topology = detect_numa_topology()
+        config = get_optimal_config(topology)
+        print("Auto-detected KUMF configuration:")
+        for k, v in config.items():
+            print(f"  {k}={v}")
+        print()
+        print(f"NUMA topology: {len(topology['nodes'])} nodes, {len(topology.get('sockets', []))} sockets")
+        if topology.get("sockets"):
+            print(f"Socket layout: {topology['sockets']}")
+            print(f"Recommended: use socket 0 (nodes {topology['sockets'][0]}) for maximum stability")
+        return 0
+    elif args.daemon_cmd == "autostart":
+        if not daemon._is_running():
+            daemon.start(foreground=False)
+        return 0
+    elif args.daemon_cmd == "shell-init":
+        print_shell_integration()
+        return 0
+    else:
+        parser.print_help()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
