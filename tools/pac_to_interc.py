@@ -307,13 +307,14 @@ def generate_interc_conf_size_based(ranges, output_path, fast_node=0, slow_node=
                 size_threshold = e - s
                 break
         
-        if size_threshold:
+        if size_threshold and size_threshold >= 100 * 1024 * 1024:  # ≥100MB
             f.write(f"# Auto-detected hot/cold size threshold: {size_threshold/1024/1024:.1f} MB\n")
             f.write(f"# Allocations larger than this → fast node (hot data)\n")
             f.write(f"# Smaller allocations stay local via L1 thread affinity\n\n")
             f.write(f"size_gt:{size_threshold} = {fast_node}  # HOT: large allocations\n")
         else:
-            f.write("# Could not determine size threshold\n")
+            f.write(f"# No large hot allocation detected (threshold={size_threshold/1024/1024:.1f}MB if size_threshold else 'N/A'}\n")
+            f.write(f"# Using L1 thread affinity only (no L2 routing rules)\n")
 
 
 def generate_interc_conf_alloc_based(alloc_pac, output_path, fast_node=0, slow_node=2):
