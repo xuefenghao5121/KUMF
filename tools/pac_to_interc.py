@@ -310,9 +310,8 @@ def generate_interc_conf_size_based(ranges, output_path, fast_node=0, slow_node=
         if size_threshold:
             f.write(f"# Auto-detected hot/cold size threshold: {size_threshold/1024/1024:.1f} MB\n")
             f.write(f"# Allocations larger than this → fast node (hot data)\n")
-            f.write(f"# Allocations smaller than this → slow node (cold data)\n\n")
+            f.write(f"# Smaller allocations stay local via L1 thread affinity\n\n")
             f.write(f"size_gt:{size_threshold} = {fast_node}  # HOT: large allocations\n")
-            f.write(f"size_lt:{size_threshold} = {slow_node}  # COLD: small allocations\n")
         else:
             f.write("# Could not determine size threshold\n")
 
@@ -341,8 +340,6 @@ def generate_interc_conf_alloc_based(alloc_pac, output_path, fast_node=0, slow_n
         f.write(f"# Alloc rules: {len(alloc_pac)} prof allocations, {len(hot_sizes)} hot, {len(cold_sizes)} cold\n\n")
         
         if hot_sizes:
-            # Hot allocations: route to fast node
-            # Use min/max range to cover typical hot alloc sizes
             hot_min = min(hot_sizes)
             hot_max = max(hot_sizes)
             f.write(f"# HOT allocations ({len(hot_sizes)}): {hot_min/1024/1024:.0f}-{hot_max/1024/1024:.0f} MB\n")
@@ -351,8 +348,10 @@ def generate_interc_conf_alloc_based(alloc_pac, output_path, fast_node=0, slow_n
         if cold_sizes:
             cold_min = min(cold_sizes)
             cold_max = max(cold_sizes)
-            f.write(f"# COLD allocations ({len(cold_sizes)}): {cold_min/1024/1024:.0f}-{cold_max/1024/1024:.0f} MB\n")
-            f.write(f"size_range:{cold_min}-{cold_max} = {slow_node}  # COLD data -> slow node\n")
+            total_cold = sum(cold_sizes) / 1024 / 1024
+            f.write(f"\n# COLD allocations ({len(cold_sizes)}): {cold_min/1024/1024:.0f}-{cold_max/1024/1024:.0f} MB, {total_cold:.0f} MB total\n")
+            f.write(f"# SKIPPED: cold data stays local via L1 thread affinity (NO routing rule)\n")
+            f.write(f"# Routing cold data to a fixed node would break per-thread locality\n")
         
         if not hot_sizes and not cold_sizes:
             f.write("# No actionable hot/cold allocations found\n")
