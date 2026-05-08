@@ -612,19 +612,16 @@ class KumfDaemon:
                 prof_files = sorted(Path("/tmp/kumf").glob("data.raw.*"))
                 conf_path = output_dir / "kumf.conf"
 
+                interc_cmd = [
+                    sys.executable, str(PAC_TO_INTERC),
+                    "--pac-csv", str(pac_csv),
+                    "--mode", "alloc", "-o", str(conf_path),
+                ]
                 if prof_files:
-                    interc_cmd = [
-                        sys.executable, str(PAC_TO_INTERC),
-                        "--pac-csv", str(pac_csv),
-                        "--prof-log", str(prof_files[-1]),
-                        "--mode", "alloc", "-o", str(conf_path),
-                    ]
-                else:
-                    interc_cmd = [
-                        sys.executable, str(PAC_TO_INTERC),
-                        "--pac-csv", str(pac_csv),
-                        "--mode", "size", "-o", str(conf_path),
-                    ]
+                    # Insert --prof-log PATH before --mode (at index 4)
+                    interc_cmd.insert(4, str(prof_files[-1]))
+                    interc_cmd.insert(4, "--prof-log")
+                    print(f"   Prof log: {prof_files[-1].name} ({len(prof_files)} files)")
 
                 print(f"   Running pac_to_interc.py...")
                 rc = subprocess.run(interc_cmd, capture_output=True)
