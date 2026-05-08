@@ -602,7 +602,7 @@ class KumfDaemon:
                 cpu_chunks.append((cpu, chunk_file))
             
             # Run perf report -D per CPU in parallel (up to 16 concurrent)
-            max_procs = min(16, len(cpu_chunks))
+            max_procs = min(32, len(cpu_chunks))
             import threading as _thr
             import queue as _q
             cpu_queue = _q.Queue()
@@ -669,7 +669,7 @@ class KumfDaemon:
         pac_cmd = [sys.executable, str(SPE_PAGE_PAC), "-i", str(raw_file), "-o", str(output_dir)]
         nproc = _os_pac.cpu_count() or 4
         if nproc > 1:
-            pac_cmd += ["-j", str(min(nproc, 8))]  # cap at 8 to avoid memory pressure
+            pac_cmd += ["-j", str(min(nproc, 32))]  # capped for memory
         print(f"   Running: {' '.join(pac_cmd)}")
         pac_result = subprocess.run(pac_cmd, capture_output=True)
         stderr_text = pac_result.stderr.decode('utf-8', errors='replace') if pac_result.stderr else ''

@@ -485,7 +485,7 @@ def parse_file_parallel(filepath, num_workers=None):
     import os as _os
     
     if num_workers is None:
-        num_workers = min(multiprocessing.cpu_count() or 4, 16)
+        num_workers = min(multiprocessing.cpu_count() or 4, 32)
     
     file_size = _os.path.getsize(filepath)
     if file_size < 10 * 1024 * 1024:  # < 10MB: not worth parallel overhead
