@@ -663,7 +663,18 @@ class KumfDaemon:
                 )
                 self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
         else:
-            print("   ⚠️  No SPE data captured")
+            # spe_page_pac ran OK but produced no stderr output
+            # → no PAC hot pages found, save affinity-only baseline
+            print(f"   ⚠️  PAC found no hot pages (empty output)")
+            print()
+            print("✅ Baseline config saved (affinity-only mode)")
+            conf_path = output_dir / "kumf.conf"
+            conf_path.write_text(
+                "# KUMF auto-config: affinity only (PAC found no hot pages)\n"
+                "# Tip: try --min-lat 32 to capture more L3-access data\n"
+            )
+            self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
+            return 0
 
         print()
         print(f"✅ Profile saved for: {' '.join(cmd)}")
