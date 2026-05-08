@@ -359,6 +359,205 @@ def detect_knee(pac_scores):
     return hot_threshold, warm_threshold, cold_threshold
 
 
+def _parse_chunk_worker(args):
+    """Worker: parse a file chunk at [start, end) byte offsets.
+    Returns a dict suitable for merge (page_stats as list-of-dicts)."""
+    filepath, start, end = args
+    with open(filepath, 'rb') as f:
+        f.seek(start)
+        data = f.read(end - start).decode('utf-8', errors='replace')
+    
+    # Reuse the same parsing logic as parse_stream, operating on lines
+    page_stats = defaultdict(lambda: {
+        'access_count': 0,
+        'lat_tot_sum': 0,
+        'lat_tot_max': 0,
+        'lat_issue_sum': 0,
+        'lat_xlat_sum': 0,
+        'lat_9e_sum': 0,
+        'lat_9e_count': 0,
+        'llc_refill_count': 0,
+        'llc_access_count': 0,
+        'tlb_refill_count': 0,
+        'ld_count': 0,
+        'st_count': 0,
+        'sve_count': 0,
+    })
+    
+    in_spe_section = True  # chunks already start at record boundaries
+    current_sample = {}
+    records_parsed = 0
+    total_lines = 0
+    
+    for line in data.split('\n'):
+        line = line.strip()
+        total_lines += 1
+        
+        if not line:
+            continue
+        
+        # TS → 记录结束，flush
+        ts_match = RE_TS.search(line)
+        if ts_match:
+            if _sample_is_valid(current_sample):
+                _flush_sample(current_sample, page_stats)
+                records_parsed += 1
+            current_sample = {}
+            continue
+        
+        if not _is_spe_packet(line):
+            continue
+        
+        # PC (restart record on new PC if we already have one)
+        pc_match = RE_PC.search(line)
+        if pc_match:
+            if _sample_is_valid(current_sample):
+                _flush_sample(current_sample, page_stats)
+                records_parsed += 1
+            current_sample = {'pc': pc_match.group(1)}
+            continue
+        
+        # VA (virtual address = data address)
+        va_match = RE_VA.search(line)
+        if va_match:
+            current_sample['va'] = va_match.group(1)
+            continue
+        
+        # LAT TOT / ISSUE / XLAT
+        lat_match = RE_LAT.search(line)
+        if lat_match:
+            val = int(lat_match.group(1))
+            tag = lat_match.group(2) if lat_match.lastindex >= 2 else ''
+            if tag == 'TOT':
+                current_sample['lat_tot'] = val
+            elif tag == 'ISSUE':
+                current_sample['lat_issue'] = val
+            elif tag == 'XLAT':
+                current_sample['lat_xlat'] = current_sample.get('lat_xlat', 0) + val
+            else:
+                # Bare LAT number (usually 0x9e complement)
+                if 'lat_9e_max' not in current_sample or val > current_sample.get('lat_9e_max', 0):
+                    current_sample['lat_9e_max'] = val
+                current_sample['lat_9e_count'] = current_sample.get('lat_9e_count', 0) + 1
+                current_sample['lat_9e_sum'] = current_sample.get('lat_9e_sum', 0) + val
+            continue
+        
+        # EV (events)
+        ev_match = RE_EV.search(line)
+        if ev_match:
+            events = ev_match.group(1)
+            if 'LLC-REFILL' in events:
+                current_sample['llc_refill'] = True
+            if 'LLC-ACCESS' in events:
+                current_sample['llc_access'] = True
+            if 'TLB-REFILL' in events:
+                current_sample['tlb_refill'] = True
+            continue
+        
+        # LD/ST operation
+        op_match = RE_OP.search(line)
+        if op_match:
+            op_type = op_match.group(1)
+            op_data = op_match.group(2)
+            if op_type == 'LD':
+                current_sample['op'] = 'LD'
+            elif op_type == 'ST':
+                current_sample['op'] = 'ST'
+            if 'SIMD' in op_data or 'SVE' in op_data:
+                current_sample['sve'] = True
+            continue
+    
+    # Flush last sample
+    if _sample_is_valid(current_sample):
+        _flush_sample(current_sample, page_stats)
+        records_parsed += 1
+    
+    # Return as plain dict (pickle-friendly)
+    return dict(page_stats), records_parsed, total_lines
+
+
+def parse_file_parallel(filepath, num_workers=None):
+    """Parse a raw perf report dump in parallel using multiple processes.
+    
+    Splits the file at SPE record boundaries (TS lines) for safe parallel parsing.
+    """
+    import multiprocessing
+    import os as _os
+    
+    if num_workers is None:
+        num_workers = min(multiprocessing.cpu_count() or 4, 16)
+    
+    file_size = _os.path.getsize(filepath)
+    if file_size < 10 * 1024 * 1024:  # < 10MB: not worth parallel overhead
+        return parse_stream(open(filepath))
+    
+    # Find chunk boundaries at SPE record boundaries
+    chunk_size = file_size // num_workers
+    boundaries = [0]
+    
+    with open(filepath, 'rb') as f:
+        for i in range(1, num_workers):
+            offset = i * chunk_size
+            f.seek(offset)
+            # Read forward to next 'TS ' line (record boundary)
+            for _ in range(10000):  # safety limit
+                line = f.readline()
+                if not line:
+                    break
+                if line.startswith(b'TS '):
+                    boundaries.append(f.tell())
+                    break
+            if len(boundaries) <= i:
+                boundaries.append(offset + chunk_size * i)
+    boundaries.append(file_size)
+    
+    # Deduplicate and sort
+    boundaries = sorted(set(boundaries))
+    
+    # Build chunk ranges
+    chunks = []
+    for i in range(len(boundaries) - 1):
+        if boundaries[i + 1] > boundaries[i]:
+            chunks.append((filepath, boundaries[i], boundaries[i + 1]))
+    
+    if len(chunks) < 2:
+        return parse_stream(open(filepath))
+    
+    print(f"   Parallel parsing: {len(chunks)} chunks × {num_workers} workers", file=sys.stderr)
+    
+    with multiprocessing.Pool(min(num_workers, len(chunks))) as pool:
+        chunk_results = pool.map(_parse_chunk_worker, chunks)
+    
+    # Merge results
+    merged = defaultdict(lambda: {
+        'access_count': 0,
+        'lat_tot_sum': 0,
+        'lat_tot_max': 0,
+        'lat_issue_sum': 0,
+        'lat_xlat_sum': 0,
+        'lat_9e_sum': 0,
+        'lat_9e_count': 0,
+        'llc_refill_count': 0,
+        'llc_access_count': 0,
+        'tlb_refill_count': 0,
+        'ld_count': 0,
+        'st_count': 0,
+        'sve_count': 0,
+    })
+    
+    total_records = 0
+    total_lines = 0
+    for stats_dict, recs, lns in chunk_results:
+        total_records += recs
+        total_lines += lns
+        for page, s in stats_dict.items():
+            m = merged[page]
+            for k in m:
+                m[k] += s[k]
+    
+    return dict(merged), total_records, total_lines
+
+
 def generate_report(pac_scores, hot_th, warm_th, cold_th, records_parsed, total_lines, output_dir):
     """生成人类可读报告 + CSV + JSON + kumf.conf"""
     
@@ -550,19 +749,25 @@ def _find_contiguous_ranges(pages):
 def main():
     parser = argparse.ArgumentParser(description='KUMF SPE Page-Level PAC Analyzer')
     parser.add_argument('--output', '-o', default='/tmp/kumf', help='Output directory')
+    parser.add_argument('--input', '-i', default=None, help='Raw dump file (perf report -D output). If not set, reads from stdin.')
+    parser.add_argument('--workers', '-j', type=int, default=None, help='Parallel workers (default: CPU count, only with --input)')
     parser.add_argument('--max-records', type=int, default=None, help='Max records to parse')
     parser.add_argument('--mlp', type=float, default=1.0, help='MLP estimate for PAC calculation')
     parser.add_argument('--hot-threshold', type=float, default=None, help='Override hot PAC threshold')
     parser.add_argument('--warm-threshold', type=float, default=None, help='Override warm PAC threshold')
     args = parser.parse_args()
     
-    print(f"🦐 KUMF SPE Page-Level PAC Analyzer v0.2")
-    print(f"   Reading from stdin (pipe perf report -D output)...")
-    print(f"   MLP estimate: {args.mlp}")
-    if args.max_records:
-        print(f"   Max records: {args.max_records:,}")
+    print(f"🦐 KUMF SPE Page-Level PAC Analyzer v0.3", file=sys.stderr)
+    if args.input:
+        print(f"   Input file: {args.input}", file=sys.stderr)
+        if args.workers:
+            print(f"   Workers: {args.workers}", file=sys.stderr)
+        page_stats, records_parsed, total_lines = parse_file_parallel(args.input, num_workers=args.workers)
+    else:
+        print(f"   Reading from stdin (pipe perf report -D output)...", file=sys.stderr)
+        page_stats, records_parsed, total_lines = parse_stream(sys.stdin, max_records=args.max_records)
     
-    page_stats, records_parsed, total_lines = parse_stream(sys.stdin, max_records=args.max_records)
+    print(f"   MLP estimate: {args.mlp}", file=sys.stderr)
     
     if not page_stats:
         print("❌ No SPE records found! Check input format.")

@@ -593,13 +593,14 @@ class KumfDaemon:
             return 0
         print(f"   Raw dump: {raw_file.stat().st_size / (1024*1024):.1f} MB")
 
-        # Feed raw dump to spe_page_pac.py
-        print(f"   Running spe_page_pac.py -o {output_dir}")
-        with open(raw_file, 'rb') as f:
-            pac_result = subprocess.run(
-                [sys.executable, str(SPE_PAGE_PAC), "-o", str(output_dir)],
-                stdin=f, capture_output=True
-            )
+        # Feed raw dump to spe_page_pac.py (parallel if file available)
+        import os as _os_pac
+        pac_cmd = [sys.executable, str(SPE_PAGE_PAC), "-i", str(raw_file), "-o", str(output_dir)]
+        nproc = _os_pac.cpu_count() or 4
+        if nproc > 1:
+            pac_cmd += ["-j", str(min(nproc, 8))]  # cap at 8 to avoid memory pressure
+        print(f"   Running: {' '.join(pac_cmd)}")
+        pac_result = subprocess.run(pac_cmd, capture_output=True)
         stderr_text = pac_result.stderr.decode('utf-8', errors='replace') if pac_result.stderr else ''
         if pac_result.returncode != 0:
             print(f"   ❌ spe_page_pac.py failed (rc={pac_result.returncode})")
