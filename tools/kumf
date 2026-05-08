@@ -203,15 +203,29 @@ def cmd_diagnose(args):
     try:
         result = subprocess.run(perf_cmd, env=env, timeout=600)
         elapsed = time.time() - t0
-        print(f"✅ Sampling done ({elapsed:.1f}s)")
+        print(f"✅ Sampling done ({elapsed:.1f}s, rc={result.returncode})")
     except subprocess.TimeoutExpired:
         print("❌ Workload timed out")
         return 1
     print()
 
-    if not spe_data.exists():
-        print("❌ No SPE data captured")
-        return 1
+    if not spe_data.exists() or spe_data.stat().st_size == 0:
+        # SPE 没采到数据，但可以给出 affinity-only 兜底配置
+        print(f"⚠️  SPE data not available: {spe_data}")
+        if result.returncode != 0:
+            print(f"   perf exit code: {result.returncode}")
+        print(f"   (可尝试 --min-lat 0 减少过滤)")
+        print()
+        print("📋 Generating affinity-only config (KUMF L1)...")
+        conf_path = output_dir / "kumf.conf"
+        conf_path.write_text(
+            "# KUMF auto-config: affinity only (no SPE data)\n"
+            "# Tip: try --min-lat 0 to capture more samples\n"
+        )
+        print(f"   Config: {conf_path}")
+        print()
+        print(f"  Next: kumf daemon wrap -- {' '.join([workload] + workload_args)}")
+        return 0
 
     # 3. 解析 SPE → page PAC
     print("── Step 2/4: SPE LAT → Page PAC Scoring ────────────")
@@ -249,17 +263,18 @@ def cmd_diagnose(args):
         ]
         result = subprocess.run(interc_cmd, capture_output=True, text=True)
         if result.returncode != 0:
+            print(f"   ⚠️  pac_to_interc failed (alloc), trying without prof-log")
             interc_cmd = [
                 sys.executable, str(PAC_TO_INTERC),
                 "--pac-csv", str(pac_csv),
-                "--mode", "size", "-o", str(conf_path),
+                "--mode", "alloc", "-o", str(conf_path),
             ]
             result = subprocess.run(interc_cmd, capture_output=True, text=True)
     elif pac_csv.exists():
         interc_cmd = [
             sys.executable, str(PAC_TO_INTERC),
             "--pac-csv", str(pac_csv),
-            "--mode", "size", "-o", str(conf_path),
+            "--mode", "alloc", "-o", str(conf_path),
         ]
         result = subprocess.run(interc_cmd, capture_output=True, text=True)
 
