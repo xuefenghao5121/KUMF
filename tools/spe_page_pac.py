@@ -514,16 +514,16 @@ def generate_report(pac_scores, hot_th, warm_th, cold_th, records_parsed, total_
             if len(ranges) > 200:
                 f.write(f"# ... {len(ranges) - 200} more ranges (see page_pac.csv for full list)\n")
     
-    print(f"\n✅ Analysis complete!")
-    print(f"   Lines processed:  {total_lines:,}")
-    print(f"   Records parsed:   {records_parsed:,}")
-    print(f"   Unique pages:     {len(sorted_pages):,}")
-    print(f"   HOT: {len(hot_pages)}  WARM: {len(warm_pages)}  COLD: {len(cold_pages)}")
-    print(f"\n   Output files:")
-    print(f"   📄 Report:  {report_path}")
-    print(f"   📊 CSV:     {csv_path}")
-    print(f"   📋 JSON:    {json_path}")
-    print(f"   ⚙️  Config:  {conf_path}")
+    print(f"\n✅ Analysis complete!", file=sys.stderr)
+    print(f"   Lines processed:  {total_lines:,}", file=sys.stderr)
+    print(f"   Records parsed:   {records_parsed:,}", file=sys.stderr)
+    print(f"   Unique pages:     {len(sorted_pages):,}", file=sys.stderr)
+    print(f"   HOT: {len(hot_pages)}  WARM: {len(warm_pages)}  COLD: {len(cold_pages)}", file=sys.stderr)
+    print(f"\n   Output files:", file=sys.stderr)
+    print(f"   📄 Report:  {report_path}", file=sys.stderr)
+    print(f"   📊 CSV:     {csv_path}", file=sys.stderr)
+    print(f"   📋 JSON:    {json_path}", file=sys.stderr)
+    print(f"   ⚙️  Config:  {conf_path}", file=sys.stderr)
 
 
 def _find_contiguous_ranges(pages):
