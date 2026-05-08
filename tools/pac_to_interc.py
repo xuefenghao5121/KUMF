@@ -313,7 +313,8 @@ def generate_interc_conf_size_based(ranges, output_path, fast_node=0, slow_node=
             f.write(f"# Smaller allocations stay local via L1 thread affinity\n\n")
             f.write(f"size_gt:{size_threshold} = {fast_node}  # HOT: large allocations\n")
         else:
-            f.write(f"# No large hot allocation detected (threshold={size_threshold/1024/1024:.1f}MB if size_threshold else 'N/A'}\n")
+            ts = f"{size_threshold/1024/1024:.1f}MB" if size_threshold else "N/A"
+            f.write(f"# No large hot allocation detected (threshold={ts})\n")
             f.write(f"# Using L1 thread affinity only (no L2 routing rules)\n")
 
 
