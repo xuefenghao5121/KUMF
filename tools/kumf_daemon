@@ -532,8 +532,18 @@ class KumfDaemon:
 
         profile_time = time.time() - t0
 
+        # Diagnostic: show what perf produced
+        _stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+        if _stderr.strip():
+            # perf usually outputs to stderr
+            perf_lines = [l for l in _stderr.strip().split('\n') if '[ perf record:' in l or 'samples' in l.lower()]
+            if perf_lines:
+                for l in perf_lines[:3]:
+                    print(f"   perf: {l.strip()}")
+
         if not profiling_attempted or not spe_data.exists():
             print(f"   Profiling failed — SPE may not be available on this platform")
+            print(f"   perf stderr: {_stderr[:300] if _stderr else '(none)'}")
             print()
             print("✅ Baseline config saved (affinity-only mode)")
             conf_path = output_dir / "kumf.conf"
@@ -541,16 +551,26 @@ class KumfDaemon:
             self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
             return 0
 
-        print(f"   Profiled: {profile_time:.2f}s (event={spe_event})")
+        import os as _os2
+        _st = _os2.stat(str(spe_data))
+        print(f"   Profiled: {profile_time:.2f}s (event={spe_event}), spe.perf={_st.st_size / (1024*1024):.1f} MB")
         print()
 
         # Step 3: Analyze SPE → generate config
         print("── Step 3/3: Analysis → Config ────────────────────")
-        if not spe_data.exists() or spe_data.stat().st_size == 0:
-            print("   ⚠️  No SPE data captured")
+        # Verify data by trying perf report (st_size can be stale on some FS)
+        if not spe_data.exists():
+            print(f"   ⚠️  SPE data missing: {spe_data}")
+            print()
+            print("✅ Baseline config saved (affinity-only mode)")
+            conf_path = output_dir / "kumf.conf"
+            conf_path.write_text("# KUMF auto-config: affinity only (SPE data missing)\n")
+            self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
             return 0
 
-        print(f"   SPE data: {spe_data.stat().st_size / (1024*1024):.1f} MB")
+        import os as _os
+        _st = _os.stat(str(spe_data))
+        print(f"   SPE data: {_st.st_size / (1024*1024):.1f} MB ({spe_data})")
         pac_csv = output_dir / "page_pac.csv"
         raw_file = output_dir / "spe_raw.txt"
 
@@ -565,6 +585,11 @@ class KumfDaemon:
             stderr_text = rc.stderr.decode('utf-8', errors='replace') if rc.stderr else ''
             print(f"   ❌ perf report failed (rc={rc.returncode}): {stderr_text[:200]}")
             raw_file.unlink(missing_ok=True)
+            print()
+            print("✅ Baseline config saved (affinity-only mode)")
+            conf_path = output_dir / "kumf.conf"
+            conf_path.write_text("# KUMF auto-config: affinity only (perf report failed)\n")
+            self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
             return 0
         print(f"   Raw dump: {raw_file.stat().st_size / (1024*1024):.1f} MB")
 
@@ -646,7 +671,6 @@ class KumfDaemon:
         print()
         print(f"✅ Profile saved for: {' '.join(cmd)}")
         print(f"   Baseline: {baseline_time:.2f}s")
-        print(f"   Next run: kumf daemon wrap -- {' '.join(cmd)}")
         return 0
 
     def _save_profile(self, cmd_hash, conf_path, baseline_time, exe_path=None):
