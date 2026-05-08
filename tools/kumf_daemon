@@ -574,23 +574,94 @@ class KumfDaemon:
         pac_csv = output_dir / "page_pac.csv"
         raw_file = output_dir / "spe_raw.txt"
 
-        # Dump perf report -D to file (avoids pipe buffer deadlock)
-        print("   Dumping SPE records (perf report -D)...")
-        with open(raw_file, 'wb') as f:
-            rc = subprocess.run(
-                ["perf", "report", "-D", "-i", str(spe_data)],
-                stdout=f, stderr=subprocess.PIPE
-            )
-        if rc.returncode != 0:
-            stderr_text = rc.stderr.decode('utf-8', errors='replace') if rc.stderr else ''
-            print(f"   ❌ perf report failed (rc={rc.returncode}): {stderr_text[:200]}")
-            raw_file.unlink(missing_ok=True)
-            print()
-            print("✅ Baseline config saved (affinity-only mode)")
-            conf_path = output_dir / "kumf.conf"
-            conf_path.write_text("# KUMF auto-config: affinity only (perf report failed)\n")
-            self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
-            return 0
+        # Parallel dump: split by CPU for speed (ARM SPE is per-CPU)
+        if spe_data.stat().st_size < 10 * 1024 * 1024:  # < 10MB: simple path
+            with open(raw_file, 'wb') as f:
+                rc_dump = subprocess.run(
+                    ["perf", "report", "-D", "--no-demangle", "-i", str(spe_data)],
+                    stdout=f, stderr=subprocess.PIPE
+                )
+            if rc_dump.returncode != 0 or raw_file.stat().st_size == 0:
+                stderr_text = rc_dump.stderr.decode('utf-8', errors='replace') if rc_dump.stderr else ''
+                print(f"   ❌ perf report failed (rc={rc_dump.returncode}): {stderr_text[:200]}")
+                raw_file.unlink(missing_ok=True)
+                print()
+                print("✅ Baseline config saved (affinity-only mode)")
+                conf_path = output_dir / "kumf.conf"
+                conf_path.write_text("# KUMF auto-config: affinity only (perf report failed)\n")
+                self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
+                return 0
+        else:
+            # Per-CPU parallel dump: each CPU's SPE stream is independent
+            import os as _os_cpus
+            ncpus = _os_cpus.cpu_count() or 120
+            print(f"   Parallel dump: splitting by {ncpus} CPUs...")
+            cpu_chunks = []
+            for cpu in range(min(ncpus, 256)):
+                chunk_file = output_dir / f"spe_cpu_{cpu:03d}.txt"
+                cpu_chunks.append((cpu, chunk_file))
+            
+            # Run perf report -D per CPU in parallel (up to 16 concurrent)
+            max_procs = min(16, len(cpu_chunks))
+            import threading as _thr
+            import queue as _q
+            cpu_queue = _q.Queue()
+            for c in cpu_chunks:
+                cpu_queue.put(c)
+            
+            errors = []
+            def _dump_worker():
+                while True:
+                    try:
+                        cpu, chunk = cpu_queue.get_nowait()
+                    except _q.Empty:
+                        return
+                    try:
+                        with open(chunk, 'wb') as f:
+                            rc = subprocess.run(
+                                ["perf", "report", "-D", "--no-demangle",
+                                 "--cpu", str(cpu), "-i", str(spe_data)],
+                                stdout=f, stderr=subprocess.PIPE, timeout=300
+                            )
+                    except Exception as e:
+                        errors.append(f"cpu={cpu}: {e}")
+            
+            workers = [_thr.Thread(target=_dump_worker) for _ in range(max_procs)]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join()
+            
+            if errors:
+                print(f"   ⚠️  {len(errors)} CPU dumps failed: {errors[:3]}")
+            
+            # Concatenate all chunks into raw_file
+            print(f"   Merging {len(cpu_chunks)} CPU dumps...")
+            with open(raw_file, 'wb') as out:
+                for cpu, chunk in cpu_chunks:
+                    if chunk.exists() and chunk.stat().st_size > 0:
+                        with open(chunk, 'rb') as inp:
+                            out.write(inp.read())
+                        chunk.unlink()  # clean up
+            
+            if raw_file.stat().st_size == 0:
+                # Fallback: single-threaded dump
+                print(f"   ⚠️  Per-CPU dump produced no data, falling back to single-threaded")
+                with open(raw_file, 'wb') as f:
+                    rc_single = subprocess.run(
+                        ["perf", "report", "-D", "--no-demangle", "-i", str(spe_data)],
+                        stdout=f, stderr=subprocess.PIPE
+                    )
+                if rc_single.returncode != 0:
+                    stderr_text = rc_single.stderr.decode('utf-8', errors='replace') if rc_single.stderr else ''
+                    print(f"   ❌ perf report failed (rc={rc_single.returncode}): {stderr_text[:200]}")
+                    raw_file.unlink(missing_ok=True)
+                    print()
+                    print("✅ Baseline config saved (affinity-only mode)")
+                    conf_path = output_dir / "kumf.conf"
+                    conf_path.write_text("# KUMF auto-config: affinity only (perf report failed)\n")
+                    self._save_profile(cmd_hash, str(conf_path), baseline_time, exe_path=exe_path)
+                    return 0
         print(f"   Raw dump: {raw_file.stat().st_size / (1024*1024):.1f} MB")
 
         # Feed raw dump to spe_page_pac.py (parallel if file available)
