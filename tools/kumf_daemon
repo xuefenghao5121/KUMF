@@ -705,7 +705,14 @@ class KumfDaemon:
                 rc = subprocess.run(interc_cmd, capture_output=True)
                 if rc.returncode != 0:
                     err = rc.stderr.decode('utf-8', errors='replace') if rc.stderr else ''
-                    print(f"   ❌ pac_to_interc failed (rc={rc.returncode}): {err[:300]}")
+                    print(f"   ❌ pac_to_interc failed (rc={rc.returncode})")
+                    # Show full stderr and stdout for diagnosis
+                    stderr_full = rc.stderr.decode('utf-8', errors='replace') if rc.stderr else ''
+                    stdout_full = rc.stdout.decode('utf-8', errors='replace') if rc.stdout else ''
+                    if stderr_full.strip():
+                        print(f"   stderr: {stderr_full[:2000]}")
+                    if stdout_full.strip():
+                        print(f"   stdout: {stdout_full[:500]}")
                 elif conf_path.exists():
                     nc = subprocess.run(["wc", "-l", str(conf_path)],
                                        capture_output=True)
