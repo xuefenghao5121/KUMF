@@ -228,8 +228,12 @@ def cross_correlate(pages, allocations):
     return alloc_pac
 
 
-def generate_interc_conf_page_ranges(ranges, output_path, fast_node=0, slow_node=2):
-    """生成基于 page_range 的 interc 配置（需要 interc 支持 page_range）"""
+def generate_interc_conf_page_ranges(ranges, output_path, fast_node='local', slow_node='local'):
+    """生成基于 page_range 的 interc 配置（需要 interc 支持 page_range）
+    
+    fast_node/slow_node: NUMA node id, or 'local' for home-node-relative placement.
+    When 'local', interc routes to the calling thread's home node (relative nearness).
+    """
     
     hot_ranges = [(s, e, pc, ta) for s, e, t, pc, ta, ap in ranges if t == 'HOT']
     warm_ranges = [(s, e, pc, ta) for s, e, t, pc, ta, ap in ranges if t == 'WARM']
@@ -257,7 +261,7 @@ def generate_interc_conf_page_ranges(ranges, output_path, fast_node=0, slow_node
             f.write(f"0x{start:x}-0x{end:x} = {slow_node}  # {pc} pages, {size_mb:.1f}MB, access={ta}\n")
 
 
-def generate_interc_conf_size_based(ranges, output_path, fast_node=0, slow_node=2):
+def generate_interc_conf_size_based(ranges, output_path, fast_node='local', slow_node='local'):
     """
     生成基于 size 的 interc 配置（当前 interc 原生支持）
     
@@ -318,12 +322,16 @@ def generate_interc_conf_size_based(ranges, output_path, fast_node=0, slow_node=
             f.write(f"# Using L1 thread affinity only (no L2 routing rules)\n")
 
 
-def generate_interc_conf_alloc_based(alloc_pac, output_path, fast_node=0, slow_node=2):
+def generate_interc_conf_alloc_based(alloc_pac, output_path, fast_node='local', slow_node='local'):
     """Generate SIZE-based interc config from prof cross-correlation.
     
     Key insight: virtual addresses change every run (ASLR).
     Size-based rules are stable — alloc sizes are deterministic.
     Name-based rules are loaded by interc but not matched (no match_name impl).
+    
+    fast_node/slow_node: NUMA node id, or 'local' for home-node-relative routing.
+    When 'local', the config uses the 'local' keyword which interc resolves
+    to the calling thread's home node at runtime (relative nearness).
     """
     
     # Aggregate hot/cold by allocation size
@@ -378,8 +386,8 @@ def main():
     parser.add_argument('--pac-csv', required=True, help='page_pac.csv from spe_page_pac.py')
     parser.add_argument('--prof-log', default=None, help='prof allocation log (optional, for cross-correlation)')
     parser.add_argument('--output', '-o', default='kumf.conf', help='Output interc config file')
-    parser.add_argument('--fast-node', type=int, default=0, help='NUMA node for hot data')
-    parser.add_argument('--slow-node', type=int, default=2, help='NUMA node for cold data')
+    parser.add_argument('--fast-node', default='local', help='NUMA node for hot data (int or "local" for home-node-relative)')
+    parser.add_argument('--slow-node', default='local', help='NUMA node for cold data (int or "local" for home-node-relative)')
     parser.add_argument('--mode', choices=['alloc', 'size'], default='alloc',
                         help='Config generation mode: alloc (caller-based, needs prof), size (fallback, no prof needed)')
     args = parser.parse_args()
@@ -387,7 +395,19 @@ def main():
     print(f"🦐 KUMF PAC → interc config generator")
     print(f"   PAC CSV: {args.pac_csv}")
     print(f"   Mode: {args.mode}")
-    print(f"   Fast node: {args.fast_node} | Slow node: {args.slow_node}")
+    # Resolve node ids: 'local' stays as string for config, int for numeric
+    try:
+        fast_node = int(args.fast_node)
+    except ValueError:
+        fast_node = args.fast_node  # 'local' or other keyword
+    try:
+        slow_node = int(args.slow_node)
+    except ValueError:
+        slow_node = args.slow_node
+    
+    fn_label = f"node {fast_node}" if isinstance(fast_node, int) else "home node (local)"
+    sn_label = f"node {slow_node}" if isinstance(slow_node, int) else "home node (local)"
+    print(f"   Fast: {fn_label} | Slow: {sn_label}")
     
     pages = load_page_pac(args.pac_csv)
     print(f"   Loaded {len(pages)} pages")
@@ -402,9 +422,9 @@ def main():
             print(f"⚠️  No cross-correlated allocations, falling back to size-based")
             ranges = aggregate_page_ranges(pages)
             print(f"   Aggregated into {len(ranges)} page ranges")
-            generate_interc_conf_size_based(ranges, args.output, args.fast_node, args.slow_node)
+            generate_interc_conf_size_based(ranges, args.output, fast_node, slow_node)
         else:
-            generate_interc_conf_alloc_based(alloc_pac, args.output, args.fast_node, args.slow_node)
+            generate_interc_conf_alloc_based(alloc_pac, args.output, fast_node, slow_node)
     
     elif args.mode == 'alloc' and not args.prof_log:
         # 没有 prof 数据，自动 fallback
@@ -412,13 +432,13 @@ def main():
         print(f"   (Provide --prof-log for more precise alloc-based rules)")
         ranges = aggregate_page_ranges(pages)
         print(f"   Aggregated into {len(ranges)} page ranges")
-        generate_interc_conf_size_based(ranges, args.output, args.fast_node, args.slow_node)
+        generate_interc_conf_size_based(ranges, args.output, fast_node, slow_node)
     
     else:
         # size-based 估算
         ranges = aggregate_page_ranges(pages)
         print(f"   Aggregated into {len(ranges)} page ranges")
-        generate_interc_conf_size_based(ranges, args.output, args.fast_node, args.slow_node)
+        generate_interc_conf_size_based(ranges, args.output, fast_node, slow_node)
     
     print(f"\n✅ Config generated: {args.output}")
 

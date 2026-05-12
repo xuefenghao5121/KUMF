@@ -110,12 +110,76 @@ def main():
         return 1
 
 
+def show_nearness_matrix():
+    """Read NUMA distance matrix from numactl -H and display relative nearness."""
+    try:
+        result = subprocess.run(["numactl", "-H"], capture_output=True, text=True, timeout=10)
+        lines = result.stdout.strip().split("\n")
+    except Exception:
+        print("   (Cannot read NUMA distance matrix)")
+        return
+
+    # Parse distance lines: e.g. "node 0 distance: 10 21 31 31"
+    distances = {}
+    nodes = set()
+    for line in lines:
+        if "distance:" in line:
+            parts = line.split(":")
+            src = int(parts[0].replace("node", "").strip())
+            dists = [int(d) for d in parts[1].split()]
+            for dst, d in enumerate(dists):
+                distances[(src, dst)] = d
+                nodes.add(src)
+                nodes.add(dst)
+
+    if not nodes:
+        print("   (No NUMA distance data found)")
+        return
+
+    sorted_nodes = sorted(nodes)
+    n = len(sorted_nodes)
+
+    # Classify distances as LOCAL / socket / cross-socket
+    all_dists = [distances.get((i, j), 0) for i in sorted_nodes for j in sorted_nodes if i != j]
+    min_dist = min(all_dists) if all_dists else 10
+
+    print("  Relative Nearness Matrix (derived from numactl -H):")
+    print()
+
+    # Header
+    header = "  From\\To" + " " * max(0, 8 - len("From\\To"))
+    for nd in sorted_nodes:
+        header += f"  Node {nd}  "
+    print(header)
+
+    for src in sorted_nodes:
+        row = f"  Node {src}   "
+        for dst in sorted_nodes:
+            d = distances.get((src, dst), 0)
+            if src == dst:
+                label = "LOCAL  "
+            elif d <= min_dist * 2:
+                label = "socket "
+            else:
+                label = "cross  "
+            row += f"  {label} "
+        print(row)
+
+    print()
+    print("  Key: LOCAL = same NUMA node | socket = same socket, different node | cross = cross-socket")
+    print("  'Near' is relative: Node 0's DRAM is LOCAL for threads on Node 0, but cross for Node 2.")
+    print()
+
+
 # ============================================================
 # kumf config — show auto-detected optimal config
 # ============================================================
 
 def cmd_config():
     """Show auto-detected NUMA topology and optimal KUMF configuration."""
+    print("── NUMA Topology & Relative Nearness ────────────────")
+    print()
+    show_nearness_matrix()
     daemon_script = TOOLS_DIR / "kumf_daemon"
     result = subprocess.run([sys.executable, str(daemon_script), "config"])
     return result.returncode
@@ -167,7 +231,8 @@ def cmd_diagnose(args):
     print("✅ All tools available")
     print()
 
-    # NUMA topology
+    # NUMA topology + relative nearness
+    print("── NUMA Topology & Relative Nearness ────────────────")
     try:
         result = subprocess.run(["numactl", "-H"], capture_output=True, text=True, timeout=10)
         for line in result.stdout.strip().split("\n"):
@@ -176,6 +241,7 @@ def cmd_diagnose(args):
     except Exception:
         pass
     print()
+    show_nearness_matrix()
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)

@@ -190,45 +190,55 @@ static void load_rules(void) {
         if (line[0] == '#' || line[0] == '\n') continue;
         unsigned long start, end;
         int node;
-        if (sscanf(line, "0x%lx-0x%lx = %d", &start, &end, &node) == 3
+        char node_str[32];
+        if (sscanf(line, "0x%lx-0x%lx = %31s", &start, &end, node_str) == 3
             && num_addr_rules < MAX_ADDR_RULES) {
             addr_rules[num_addr_rules].start = start;
             addr_rules[num_addr_rules].end = end;
-            addr_rules[num_addr_rules].node = node;
+            /* 'local' keyword: -2 signals home-node-relative routing */
+            addr_rules[num_addr_rules].node = (strcmp(node_str, "local") == 0) ? -2 : atoi(node_str);
             num_addr_rules++;
         } else if (strncmp(line, "size_gt:", 9) == 0) {
             size_t threshold;
-            if (sscanf(line + 9, "%zu = %d", &threshold, &node) == 2
+            char node_str[32];
+            if (sscanf(line + 9, "%zu = %31s", &threshold, node_str) == 2
                 && num_size_rules < MAX_NAME_RULES) {
+                int rnode = (strcmp(node_str, "local") == 0) ? -2 : atoi(node_str);
                 size_rules[num_size_rules].min_size = threshold;
                 size_rules[num_size_rules].max_size = 0;
-                size_rules[num_size_rules].node = node;
+                size_rules[num_size_rules].node = rnode;
                 num_size_rules++;
             }
         } else if (strncmp(line, "size_lt:", 9) == 0) {
             size_t threshold;
-            if (sscanf(line + 9, "%zu = %d", &threshold, &node) == 2
+            char node_str[32];
+            if (sscanf(line + 9, "%zu = %31s", &threshold, node_str) == 2
                 && num_size_rules < MAX_NAME_RULES) {
+                int rnode = (strcmp(node_str, "local") == 0) ? -2 : atoi(node_str);
                 size_rules[num_size_rules].min_size = 0;
                 size_rules[num_size_rules].max_size = threshold;
-                size_rules[num_size_rules].node = node;
+                size_rules[num_size_rules].node = rnode;
                 num_size_rules++;
             }
         } else if (strncmp(line, "size_range:", 11) == 0) {
             size_t min_s, max_s;
-            if (sscanf(line + 11, "%zu-%zu = %d", &min_s, &max_s, &node) == 3
+            char node_str[32];
+            if (sscanf(line + 11, "%zu-%zu = %31s", &min_s, &max_s, node_str) == 3
                 && num_size_rules < MAX_NAME_RULES) {
+                int rnode = (strcmp(node_str, "local") == 0) ? -2 : atoi(node_str);
                 size_rules[num_size_rules].min_size = min_s;
                 size_rules[num_size_rules].max_size = max_s;
-                size_rules[num_size_rules].node = node;
+                size_rules[num_size_rules].node = rnode;
                 num_size_rules++;
             }
         } else {
             char pat[MAX_FUNC_NAME];
-            if (sscanf(line, "%255s = %d", pat, &node) == 2
+            char node_str[32];
+            if (sscanf(line, "%255s = %31s", pat, node_str) == 2
                 && num_name_rules < MAX_NAME_RULES) {
+                int rnode = (strcmp(node_str, "local") == 0) ? -2 : atoi(node_str);
                 strncpy(name_rules[num_name_rules].pattern, pat, MAX_FUNC_NAME-1);
-                name_rules[num_name_rules].node = node;
+                name_rules[num_name_rules].node = rnode;
                 num_name_rules++;
             }
         }
@@ -664,11 +674,32 @@ static int match_size(size_t sz) {
     return -1;
 }
 
+/*
+ * Resolve 'local' keyword: route to the calling thread's home node.
+ * This implements relative nearness: each thread's large allocations
+ * go to its own home node, not a hardcoded "fast node".
+ */
+static int resolve_node_relative(int node) {
+    if (node == -2) {
+        /* 'local' keyword: route to calling thread's home node */
+        int home = thread_home_node;
+        if (home < 0) {
+            /* Fallback: detect current node from CPU affinity */
+            int cpu = sched_getcpu();
+            if (cpu >= 0) home = numa_node_of_cpu(cpu);
+        }
+        KUMF_LOG("routing(local): home_node=%d", home);
+        return home;
+    }
+    return node;
+}
+
 static int resolve_node(void *caller, size_t sz) {
     if (!layer2_active) return -1;
 
     int node = match_size(sz);
     if (node >= 0) {
+        node = resolve_node_relative(node);
         KUMF_LOG("routing(size): sz=%zu -> node %d", sz, node);
         tl_stat_config++;
         routing_ever_used = 1;
@@ -677,6 +708,7 @@ static int resolve_node(void *caller, size_t sz) {
 
     node = match_addr(caller);
     if (node >= 0) {
+        node = resolve_node_relative(node);
         KUMF_LOG("routing(addr): caller=%p sz=%zu -> node %d", caller, sz, node);
         tl_stat_config++;
         routing_ever_used = 1;

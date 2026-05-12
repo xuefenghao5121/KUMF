@@ -661,11 +661,11 @@ def generate_report(pac_scores, hot_th, warm_th, cold_th, records_parsed, total_
         
         # LAT TOT 分布
         lat_ranges = {
-            '32-50 (L3 hit)': 0, 
-            '50-100 (L3/cluster)': 0,
-            '100-200 (local DRAM)': 0, 
-            '200-350 (remote DRAM)': 0,
-            '>350 (far remote)': 0
+            '32-50 (L3 hit / near-cache)': 0, 
+            '50-100 (L3/cluster / near-local)': 0,
+            '100-200 (local DRAM / near-node)': 0, 
+            '200-350 (socket-local / same-socket)': 0,
+            '>350 (cross-socket / far-node)': 0
         }
         for p in sorted_pages:
             avg = p['avg_lat_tot']
@@ -677,6 +677,10 @@ def generate_report(pac_scores, hot_th, warm_th, cold_th, records_parsed, total_
         
         f.write("-" * 70 + "\n")
         f.write("  LAT TOT Distribution (by access count, min_latency=32)\n")
+        f.write("  ────────────────────────────────────────────────────────────\n")
+        f.write("  Note: 'local' and 'remote' are RELATIVE to the accessing thread's home node.\n")
+        f.write("  The same DRAM is local for threads on that node, remote for all others.\n")
+        f.write("  ────────────────────────────────────────────────────────────\n")
         f.write("-" * 70 + "\n")
         for rng, count in lat_ranges.items():
             pct = count / total_access * 100 if total_access else 0
@@ -694,7 +698,27 @@ def generate_report(pac_scores, hot_th, warm_th, cold_th, records_parsed, total_
         f.write("-" * 70 + "\n")
         f.write(f"  Pages with >50% SVE accesses:  {total_sve:,} ({total_sve/total_access*100:.1f}% of access)\n")
         f.write(f"  Pages with >50% LLC refills:    {total_llc_refill:,} ({total_llc_refill/total_access*100:.1f}% of access)\n")
-        f.write(f"  SVE pages have natural high MLP → PAC adjusted down for tiered placement\n")
+        f.write(f"  SVE pages have natural high MLP → PAC adjusted down for placement\n")
+        f.write(f"\n")
+        
+        # Relative nearness explanation
+        f.write("-" * 70 + "\n")
+        f.write("  Relative Nearness Reminder\n")
+        f.write("-" * 70 + "\n")
+        f.write("  'Near' and 'far' are RELATIVE to the accessing thread's home node.\n")
+        f.write("  The same physical DRAM is near for threads on Node 0, far for Node 2.\n")
+        f.write("\n")
+        f.write("  Kunpeng 930 example (derive from numactl -H at runtime):\n")
+        f.write("\n")
+        f.write("    From\\To   Node 0    Node 1    Node 2    Node 3\n")
+        f.write("    Node 0    LOCAL     socket    cross     cross\n")
+        f.write("    Node 1    socket    LOCAL     cross     cross\n")
+        f.write("    Node 2    cross     cross     LOCAL     socket\n")
+        f.write("    Node 3    cross     cross     socket    LOCAL\n")
+        f.write("\n")
+        f.write("  L1: Each thread's MPOL_PREFERRED → its home node (near = local automatically)\n")
+        f.write("  L2: Shared allocations → route based on which home nodes access them\n")
+        f.write("  Config 'local' keyword → interc resolves to calling thread's home node at runtime\n")
     
     # === kumf.conf 生成 ===
     conf_path = os.path.join(output_dir, 'kumf.conf')
@@ -709,7 +733,7 @@ def generate_report(pac_scores, hot_th, warm_th, cold_th, records_parsed, total_
             ranges = _find_contiguous_ranges(hot_pages_sorted)
             f.write(f"# Hot page ranges: {len(ranges)} ranges covering {len(hot_pages)} pages ({len(hot_pages)*4/1024:.1f} MB)\n")
             for start, end in ranges[:200]:
-                f.write(f"page_range:0x{start:x}-0x{end:x} = 0  # FAST tier\n")
+                f.write(f"page_range:0x{start:x}-0x{end:x} = local  # HOT tier (home-node-relative)\n")
             if len(ranges) > 200:
                 f.write(f"# ... {len(ranges) - 200} more ranges (see page_pac.csv for full list)\n")
     
